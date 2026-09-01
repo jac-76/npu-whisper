@@ -52,6 +52,7 @@ reports mean ± stddev plus real-time factor for cold and warm runs:
 
 ```sh
 python3 bench.py --runs 10 --warmup 2 sample.ogg
+python3 bench.py --runs 10 --warmup 2 --power sample.ogg   # + RAPL power/energy
 ```
 
 Verified on this machine (Ryzen AI 9 365 / XDNA2, 30.0 s clip, 10 runs with the
@@ -59,14 +60,21 @@ first 2 discarded as warm-up):
 
 | Metric | Value |
 |---|---|
-| Warm mean | **5.17 s** (σ 0.04 s, n = 8) |
-| Range | 5.09 s – 5.23 s |
-| **RTF** | **≈ 0.17** (~5.8× faster than real time) |
+| Warm mean | **5.2 s** (σ 0.04 s) |
+| **RTF** | **≈ 0.17–0.19** (~5–6× faster than real time) |
+| CPU-core power while running | **~0.8 W** (idle ~0.4 W) |
+| Energy per transcription | **~45 J** over idle |
 
 System load sampled during those runs: CPU 4.3% mean against a 2.2% idle
 baseline, integrated GPU 10% against 7% idle (that delta is desktop
 compositing), discrete GPU flat at 0%. The transcription work doesn't show up on
 any of them — it's on the NPU.
+
+**CPU baseline:** `bench_cpu.py` runs the *same clip and model* through
+`whisper.cpp` on the CPU under the same RAPL measurement. On this box (16
+threads): ~6.8 s, **~400 J per transcription over idle** — roughly **10× the
+NPU's energy** for a ~25 % slower result. See `bench_cpu.py --help` for setup
+(build whisper.cpp from source; the Arch package's ggml backend is broken).
 
 ## How it works
 
