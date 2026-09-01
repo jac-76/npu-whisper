@@ -51,12 +51,22 @@ invocations, pulls the audio length from the file itself (ffprobe), and
 reports mean ± stddev plus real-time factor for cold and warm runs:
 
 ```sh
-python3 bench.py --runs 5 sample.ogg
+python3 bench.py --runs 10 --warmup 2 sample.ogg
 ```
 
-Verified result on this machine (Ryzen AI 9 365 / XDNA2, 30.0 s JFK clip):
-warm runs ≈ **5.34 s ± 0.001 s → RTF ≈ 0.18**. The tight spread shows the
-timing is NPU-bound and stable, not spinning CPU.
+Verified on this machine (Ryzen AI 9 365 / XDNA2, 30.0 s clip, 10 runs with the
+first 2 discarded as warm-up):
+
+| Metric | Value |
+|---|---|
+| Warm mean | **5.17 s** (σ 0.04 s, n = 8) |
+| Range | 5.09 s – 5.23 s |
+| **RTF** | **≈ 0.17** (~5.8× faster than real time) |
+
+System load sampled during those runs: CPU 4.3% mean against a 2.2% idle
+baseline, integrated GPU 10% against 7% idle (that delta is desktop
+compositing), discrete GPU flat at 0%. The transcription work doesn't show up on
+any of them — it's on the NPU.
 
 ## How it works
 
