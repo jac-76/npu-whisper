@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT=${FLM_PORT:-52625}
+URL="http://127.0.0.1:${PORT}"
+LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/flm"
+LOGFILE="${LOGDIR}/flm-server.log"
+PIDFILE="${LOGDIR}/flm-server.pid"
+MODEL="${FLM_ASR_MODEL:-whisper-v3}"
+JSON=0
+WAIT_MAX=90
+
+usage() {
+  cat <<EOF
+whisper-npu - transcribe audio on the AMD NPU (whisper-large-v3-turbo via FastFlowLM)
+
+USAGE:
+  whisper-npu [OPTIONS] FILE...        transcribe one or more audio files
+  whisper-npu --status                 show whether the ASR server is up
+  whisper-npu --stop                   stop the ASR server (frees NPU/model)
+  whisper-npu --start                  start the server, then exit
+
+OPTIONS:
+  -j, --json          print the full JSON response per file
+  -q, --quiet         only print the transcript text (no status lines)
+  -h, --help          show this help
+
+ENV:
+  FLM_PORT            server port (default 52625)
+  FLM_ASR_MODEL       model name sent to the API (default whisper-v3)
+
+EXAMPLES:
+  whisper-npu meeting.m4a
+  whisper-npu a.ogg b.wav --json
+  whisper-npu --status
+
+Perf (this machine, Ryzen AI 9 365 / XDNA2 NPU): 28.5s clip -> 5.4s, RTF ~0.19.
+EOF
+}
+
+msg() { if [[ $QUIET -eq 0 ]]; then printf '%s\n' "$*"; fi; }
+
+server_up() {
+  curl -s --max-time 2 "${URL}/v1/models" >/dev/null 2>&1
+}
+
+start_server() {
+  mkdir -p "${LOGDIR}"
+  if server_up; then
+    msg "server already running on ${URL}"
+    return 0
+  fi
+  msg "starting flm ASR server (loading whisper-v3:turbo)..."
+  nohup flm serve --asr 1 --host 127.0.0.1 >"${LOGFILE}" 2>&1 &
+  echo $! >"${PIDFILE}"
+  for _ in $(seq 1 "${WAIT_MAX}"); do
+    if server_up; then
+      msg "server ready on ${URL}"
+      return 0
+    fi
+    sleep 1
+  done
+  msg "ERROR: server failed to start; see ${LOGFILE}" >&2
+  return 1
+}
+
+stop_server() {
+  if [[ -f "${PIDFILE}" ]]; then
+    kill "$(cat "${PIDFILE}")" 2>/dev/null || true
+    rm -f "${PIDFILE}"
+    msg "server stopped"
+  elif server_up; then
+    msg "server running without pidfile; kill manually (pgrep -f 'flm serve')"
+  else
+    msg "server not running"
+  fi
+}
+
+transcribe() {
+  local file="$1"
+  if [[ ! -f "${file}" ]]; then
+    printf 'error: no such file: %s\n' "${file}" >&2
+    return 1
+  fi
+  if ! start_server; then
+    return 1
+  fi
+  local resp
+  resp=$(curl -s --max-time 300 "${URL}/v1/audio/transcriptions" \
+    -F "file=@${file}" \
+    -F "model=${MODEL}")
+  if [[ $JSON -eq 1 ]]; then
+    printf '%s\n' "${resp}"
+  else
+    python3 -c 'import json,sys
+d=json.load(sys.stdin)
+t=d.get("text", "")
+print(t.strip() if t is not None else d.get("error", d))' <<<"${resp}"
+  fi
+}
+
+QUIET=0
+FILES=()
+while (($#)); do
+  case "$1" in
+    -j|--json) JSON=1 ;;
+    -q|--quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --status) server_up && echo "server up on ${URL}" || echo "server down"; exit 0 ;;
+    --start) start_server; exit $? ;;
+    --stop) stop_server; exit 0 ;;
+    --) shift; while (($#)); do FILES+=("$1"); shift; done ;;
+    -*) printf 'error: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *) FILES+=("$1") ;;
+  esac
+  shift
+done
+
+if ((${#FILES[@]} == 0)); then
+  usage >&2
+  exit 1
+fi
+
+rc=0
+for f in "${FILES[@]}"; do
+  transcribe "$f" || { rc=1; }
+done
+exit $rc
