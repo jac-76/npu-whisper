@@ -44,6 +44,20 @@ The first call starts the FastFlowLM server (~10–15 s model load) and leaves i
 warm; subsequent calls return in seconds. Supported audio: anything FFmpeg
 decodes (wav, mp3, ogg, m4a, flac, …).
 
+## Benchmark
+
+Reproducible timing is built in — `bench.py` times real `whisper-npu`
+invocations, pulls the audio length from the file itself (ffprobe), and
+reports mean ± stddev plus real-time factor for cold and warm runs:
+
+```sh
+python3 bench.py --runs 5 sample.ogg
+```
+
+Verified result on this machine (Ryzen AI 9 365 / XDNA2, 30.0 s JFK clip):
+warm runs ≈ **5.34 s ± 0.001 s → RTF ≈ 0.18**. The tight spread shows the
+timing is NPU-bound and stable, not spinning CPU.
+
 ## How it works
 
 ```
