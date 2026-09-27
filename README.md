@@ -87,9 +87,10 @@ recording, Enter again to stop. Typing a line sends it as text instead.
 
 ```sh
 install -m755 npu-chat ~/.local/bin/
-npu-chat                       # default model
-npu-chat --model qwen3:4b      # pick another
-npu-chat --speak               # also speak replies (needs espeak-ng)
+npu-chat                             # NPU ASR + NPU LLM + spoken reply
+npu-chat --model qwen3:4b            # pick another LLM
+npu-chat --voice en_US-amy-medium    # pick another voice
+npu-chat --no-speak                  # text only
 ```
 
 ```
@@ -99,7 +100,8 @@ npu 17 times 3 is 51.
 [gemma3:1b - first token 0.66s, total 0.96s]
 ```
 
-Commands: `/model NAME`, `/models`, `/speak`, `/reset`, `/help`, `/quit`.
+Commands: `/model NAME`, `/models`, `/voice NAME`, `/voices`, `/speak`,
+`/reset`, `/help`, `/quit`.
 Conversation history is kept across turns, so follow-ups work.
 
 One server serves both jobs. `flm serve --asr 1` answers
@@ -120,12 +122,21 @@ Asked for the capital of Ohio and one thing it is known for, `qwen3:4b` invented
 woman". `gemma3:1b` is both faster and more accurate here, so it is the default.
 Replies stream, so first token lands in ~0.5–0.7 s.
 
-### Spoken replies are optional and not on the NPU
+### Spoken replies: piper, on the CPU
 
-FastFlowLM has no TTS, and no speech synthesiser ships on this box. `--speak`
-uses `espeak-ng` (`extra`, CPU) when it is installed and is ignored otherwise;
-`piper-tts` is not in the configured repos. Everything else — recognition and
-generation — stays on the NPU.
+Replies are spoken by default with [piper](https://github.com/rhasspy/piper)
+(`piper-tts`), voice **`en_GB-alan-medium`**. Voices are looked up in
+`~/.local/share/piper` then `~/.local/share/piper-voices`; `/voices` lists what
+is installed and `/voice NAME` switches at runtime. `--no-speak` turns it off.
+
+Measured here: 859 ms to synthesise 2.65 s of speech (RTF ≈ 0.32) at 22.05 kHz.
+
+TTS is the one part that is **not** on the NPU — FastFlowLM offers only `--asr`
+and `--embed`, no synthesis — so piper runs on the CPU. Recognition and
+generation stay on the NPU.
+
+One trap worth repeating: **never pass `--output-raw` to `piper-tts`.** It
+redirects audio to stdout and leaves `-f` empty, so playback gets silence.
 
 ### Same hallucination caveat
 

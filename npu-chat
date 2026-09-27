@@ -12,6 +12,7 @@ Typing a line sends it as text instead.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -28,6 +29,11 @@ URL = f"http://127.0.0.1:{PORT}"
 ASR_MODEL = os.environ.get("FLM_ASR_MODEL", "whisper-v3")
 DEFAULT_LLM = os.environ.get("NPU_CHAT_MODEL", "gemma3:1b")
 MIN_SECS = float(os.environ.get("NPU_CHAT_MIN_SECS", "0.4"))
+DEFAULT_VOICE = os.environ.get("NPU_CHAT_VOICE", "en_GB-alan-medium")
+VOICE_DIRS = (
+    os.path.expanduser("~/.local/share/piper"),
+    os.path.expanduser("~/.local/share/piper-voices"),
+)
 
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant running locally on a laptop NPU. "
@@ -38,6 +44,18 @@ SYSTEM_PROMPT = (
 BOLD, DIM, CYAN, GREEN, YELLOW, RED, RESET = (
     "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
 )
+
+
+_SESSION_DIR: str | None = None
+
+
+def session_dir() -> str:
+    """One temp dir per run, removed at exit, instead of one per turn."""
+    global _SESSION_DIR
+    if _SESSION_DIR is None:
+        _SESSION_DIR = tempfile.mkdtemp(prefix="npu-chat-")
+        atexit.register(shutil.rmtree, _SESSION_DIR, True)
+    return _SESSION_DIR
 
 
 def supports_color() -> bool:
@@ -73,7 +91,7 @@ def record_until_enter() -> str | None:
     if not shutil.which("pw-record"):
         print(f"{RED}pw-record not found (install pipewire-audio).{RESET}")
         return None
-    tmp = tempfile.mkdtemp(prefix="npu-chat-")
+    tmp = session_dir()
     raw = os.path.join(tmp, "raw.wav")
     proc = subprocess.Popen(
         ["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", raw],
@@ -187,14 +205,61 @@ def stream_reply(model: str, history: list[dict]) -> str:
     return reply
 
 
-def speak(text: str) -> None:
-    if not shutil.which("espeak-ng"):
+def find_voice(name: str) -> str | None:
+    """Resolve a piper voice id (or path) to an .onnx on disk."""
+    if os.path.sep in name:
+        return name if os.path.exists(name) else None
+    if name.endswith(".onnx") and os.path.exists(name):
+        return name
+    stem = name[:-5] if name.endswith(".onnx") else name
+    for d in VOICE_DIRS:
+        candidate = os.path.join(d, stem + ".onnx")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def available_voices() -> list[str]:
+    seen: list[str] = []
+    for d in VOICE_DIRS:
+        if not os.path.isdir(d):
+            continue
+        for f in sorted(os.listdir(d)):
+            if f.endswith(".onnx") and f[:-5] not in seen:
+                seen.append(f[:-5])
+    return seen
+
+
+def tts_ready() -> bool:
+    return bool(shutil.which("piper-tts")) and bool(shutil.which("pw-play"))
+
+
+def speak(text: str, voice_path: str) -> None:
+    """Synthesise with piper-tts and play through the default sink.
+
+    Do NOT pass --output-raw: it redirects audio to stdout and leaves -f empty,
+    so playback gets silence. This bit us before.
+    """
+    text = text.strip()
+    if not text:
         return
-    subprocess.Popen(
-        ["espeak-ng", "-s", "165", text],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    wav = os.path.join(session_dir(), "reply.wav")
+    try:
+        subprocess.run(
+            ["piper-tts", "-m", voice_path, "-f", wav],
+            input=text.encode(),
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        print(f"{YELLOW}piper-tts failed: {detail[:200]}{RESET}")
+        return
+    except FileNotFoundError:
+        print(f"{YELLOW}piper-tts not found.{RESET}")
+        return
+    subprocess.run(["pw-play", wav], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL)
 
 
 HELP = f"""{BOLD}Commands{RESET}
@@ -202,7 +267,9 @@ HELP = f"""{BOLD}Commands{RESET}
   type a line    send it as text instead of speaking
   {CYAN}/model NAME{RESET}    switch LLM (e.g. /model qwen3:4b)
   {CYAN}/models{RESET}        list models installed on this box
-  {CYAN}/speak{RESET}         toggle spoken replies (needs espeak-ng)
+  {CYAN}/speak{RESET}         toggle spoken replies
+  {CYAN}/voice NAME{RESET}    switch voice (e.g. /voice en_US-amy-medium)
+  {CYAN}/voices{RESET}        list voices installed on this box
   {CYAN}/reset{RESET}         clear the conversation
   {CYAN}/help{RESET}          this list
   {CYAN}/quit{RESET}          exit"""
@@ -227,8 +294,10 @@ def main() -> int:
     )
     ap.add_argument("--model", default=DEFAULT_LLM,
                     help=f"LLM to chat with (default {DEFAULT_LLM})")
-    ap.add_argument("--speak", action="store_true",
-                    help="speak replies with espeak-ng (CPU; install it separately)")
+    ap.add_argument("--no-speak", action="store_true",
+                    help="do not speak replies (text only)")
+    ap.add_argument("--voice", default=DEFAULT_VOICE,
+                    help=f"piper voice id or .onnx path (default {DEFAULT_VOICE})")
     ap.add_argument("--system", default=SYSTEM_PROMPT, help="override the system prompt")
     args = ap.parse_args()
 
@@ -236,16 +305,24 @@ def main() -> int:
         return 1
 
     model = args.model
-    speaking = args.speak
-    if speaking and not shutil.which("espeak-ng"):
-        print(f"{YELLOW}--speak ignored: espeak-ng is not installed "
-              f"(sudo pacman -S espeak-ng).{RESET}")
+    voice_path = find_voice(args.voice)
+    speaking = not args.no_speak
+    if speaking and not tts_ready():
+        missing = "piper-tts" if not shutil.which("piper-tts") else "pw-play"
+        print(f"{YELLOW}spoken replies off: {missing} not found.{RESET}")
+        speaking = False
+    elif speaking and voice_path is None:
+        print(f"{YELLOW}spoken replies off: voice {args.voice!r} not found in "
+              f"{' or '.join(VOICE_DIRS)}.{RESET}")
         speaking = False
 
     history = [{"role": "system", "content": args.system}]
 
     print(f"{BOLD}npu-chat{RESET} {DIM}- ASR and LLM both on the NPU via {URL}{RESET}")
-    print(f"{DIM}model {model} | press Enter to talk, /help for commands{RESET}\n")
+    voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
+                  if speaking and voice_path else "voice off")
+    print(f"{DIM}model {model} | {voice_note} | press Enter to talk, "
+          f"/help for commands{RESET}\n")
 
     while True:
         try:
@@ -275,12 +352,28 @@ def main() -> int:
                     print(f"{DIM}model set to {model} "
                           f"(loads on first use){RESET}")
             elif cmd == "/speak":
-                if not shutil.which("espeak-ng"):
-                    print(f"{YELLOW}espeak-ng is not installed "
-                          f"(sudo pacman -S espeak-ng).{RESET}")
+                if not tts_ready():
+                    print(f"{YELLOW}piper-tts or pw-play is missing.{RESET}")
+                elif voice_path is None:
+                    print(f"{YELLOW}no voice loaded - use /voice NAME.{RESET}")
                 else:
                     speaking = not speaking
                     print(f"{DIM}spoken replies {'on' if speaking else 'off'}.{RESET}")
+            elif cmd == "/voices":
+                names = available_voices()
+                print(f"{DIM}voices: {', '.join(names) if names else 'none found'}{RESET}")
+            elif cmd == "/voice":
+                if not rest:
+                    current = os.path.basename(voice_path)[:-5] if voice_path else "none"
+                    print(f"{DIM}current voice: {current}{RESET}")
+                else:
+                    found = find_voice(rest)
+                    if found is None:
+                        print(f"{YELLOW}voice {rest!r} not found - /voices to list{RESET}")
+                    else:
+                        voice_path = found
+                        speaking = tts_ready()
+                        print(f"{DIM}voice set to {rest}.{RESET}")
             else:
                 print(f"{YELLOW}unknown command {cmd} - try /help{RESET}")
             continue
@@ -302,8 +395,8 @@ def main() -> int:
         reply = stream_reply(model, history)
         if reply:
             history.append({"role": "assistant", "content": reply})
-            if speaking:
-                speak(reply)
+            if speaking and voice_path:
+                speak(reply, voice_path)
         else:
             history.pop()
         print()
