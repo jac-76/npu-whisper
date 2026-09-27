@@ -76,6 +76,81 @@ threads): ~6.8 s, **~400 J per transcription over idle** — roughly **10× the
 NPU's energy** for a ~25 % slower result. See `bench_cpu.py --help` for setup
 (build whisper.cpp from source; the Arch package's ggml backend is broken).
 
+## Push-to-talk dictation (`npu-dictate`)
+
+`npu-dictate` turns the same NPU server into hold-to-talk dictation: it records
+while a key is held, transcribes on the NPU, and types the result into whatever
+window has focus.
+
+```sh
+install -m755 npu-dictate ~/.local/bin/
+
+npu-dictate start      # begin recording (bind to key press)
+npu-dictate stop       # stop, transcribe on the NPU, type the text
+npu-dictate toggle     # start if idle, stop if recording
+npu-dictate cancel     # discard without typing
+npu-dictate status     # idle | recording | transcribing
+```
+
+Bind press and release to one key. Under Omarchy/Hyprland, in
+`~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("F10", "Start NPU dictation (push-to-talk)", "npu-dictate start")
+o.bind("F10", "Stop NPU dictation (push-to-talk)", "npu-dictate stop", { release = true })
+```
+
+Pipeline: `pw-record` (16 kHz mono) → `ffmpeg` normalise → NPU transcription →
+`wtype`, falling back to `wl-copy` if typing fails. It starts the ASR server on
+demand via `whisper-npu --start`. Transcription is on the NPU; recording,
+resampling and typing use a little CPU.
+
+### Why there is no LLM cleanup by default
+
+FastFlowLM serves ASR and an LLM from the same port, so piping the transcript
+through an NPU LLM for punctuation cleanup is one HTTP call away, and
+`--clean` does exactly that. It is **off by default**, because measured on this
+box `gemma3:1b` was not worth it — three identical requests, warm:
+
+| | result |
+|---|---|
+| latency | +1.1 s warm (2.3 s extra on first load) |
+| filler words | not removed (`um,` survived every run) |
+| capitalization | first word left lowercase |
+| run 3 | rewrote **"NPU"** as **"NumPy"** |
+
+`whisper-large-v3-turbo` already returns punctuated, capitalized text, so the
+cleanup pass cost latency and risked corrupting exactly the technical
+vocabulary dictation needs. `--clean` remains for experimentation.
+
+### Known limitation: hallucination on non-speech
+
+`whisper-large-v3-turbo` invents plausible sentences from room noise. Captures
+of non-speech on this box returned `"So, like, this always happens."` and
+`"that like if you go from having a"`.
+
+There is no good gate for it, and both candidates were measured and rejected:
+
+- **The server exposes no confidence signal.** `response_format=verbose_json`
+  returns `{model, text}` only — no segments, no `no_speech_prob`.
+- **Audio energy does not separate speech from noise on this microphone.**
+  All three captures below are from the same mic through this pipeline:
+
+  | capture | RMS (full-scale) | peak | transcript |
+  |---|---|---|---|
+  | speech | 0.112 | 0.913 | correct |
+  | noise | 0.104 | 0.881 | hallucinated |
+  | noise | 0.060 | 0.271 | hallucinated |
+
+  Real speech sits 8 % above a hallucinating noise capture. Any RMS threshold
+  either passes the hallucinations or discards real speech.
+
+So `npu-dictate` enforces only a duration floor (`NPU_DICTATE_MIN_SECS`,
+default 0.4 s) and logs RMS/peak per capture to
+`~/.local/state/npu-dictate/dictate.log`. Push-to-talk is what actually bounds
+the exposure: audio is captured only while the key is held. A real fix needs a
+VAD pass (e.g. Silero) ahead of transcription.
+
 ## How it works
 
 ```

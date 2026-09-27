@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT=${FLM_PORT:-52625}
+URL="http://127.0.0.1:${PORT}"
+MODEL="${FLM_ASR_MODEL:-whisper-v3}"
+CLEAN_MODEL="${NPU_DICTATE_CLEAN_MODEL:-gemma3:1b}"
+MAX_SECS="${NPU_DICTATE_MAX_SECS:-120}"
+MIN_SECS="${NPU_DICTATE_MIN_SECS:-0.4}"
+
+RUNDIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/npu-dictate"
+RAW="${RUNDIR}/raw.wav"
+WAV="${RUNDIR}/rec.wav"
+PIDFILE="${RUNDIR}/rec.pid"
+STATEFILE="${RUNDIR}/state"
+LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/npu-dictate"
+LOGFILE="${LOGDIR}/dictate.log"
+
+CLEAN=0
+NOTIFY=1
+
+mkdir -p "${RUNDIR}" "${LOGDIR}"
+
+log() { printf '%s %s\n' "$(date -Is)" "$*" >>"${LOGFILE}"; }
+state() { printf '%s' "$1" >"${STATEFILE}"; }
+notify() {
+  if [[ ${NOTIFY} -eq 1 ]] && command -v notify-send >/dev/null 2>&1; then
+    notify-send -a npu-dictate -t "${2:-2000}" "npu-dictate" "$1" || true
+  fi
+}
+
+usage() {
+  cat <<USAGE_EOF
+npu-dictate - push-to-talk dictation on the AMD NPU (whisper-large-v3-turbo via FastFlowLM)
+
+USAGE:
+  npu-dictate start          begin recording (bind to key press)
+  npu-dictate stop           stop, transcribe on the NPU, type the text
+  npu-dictate toggle         start if idle, stop if recording
+  npu-dictate cancel         discard the recording, type nothing
+  npu-dictate status         print idle|recording|transcribing
+
+OPTIONS:
+  --clean                    post-process the transcript through an NPU LLM.
+                             OFF by default and NOT recommended: measured on this
+                             box ${CLEAN_MODEL} costs ~1.1 s warm, leaves filler
+                             words in, and has rewritten "NPU" as "NumPy".
+  --no-notify                suppress desktop notifications
+  -h, --help                 show this help
+
+ENV:
+  FLM_PORT                   server port (default 52625)
+  FLM_ASR_MODEL              ASR model name (default whisper-v3)
+  NPU_DICTATE_CLEAN_MODEL    LLM for --clean (default gemma3:1b)
+  NPU_DICTATE_MAX_SECS       recording safety cap (default 120)
+  NPU_DICTATE_MIN_SECS       discard captures shorter than this (default 0.4)
+
+Transcription runs on the NPU; recording, resampling and typing use a little CPU.
+USAGE_EOF
+}
+
+server_up() { curl -s --max-time 2 "${URL}/v1/models" >/dev/null 2>&1; }
+
+ensure_server() {
+  if server_up; then return 0; fi
+  notify "starting NPU ASR server..." 4000
+  log "server down; starting via whisper-npu --start"
+  if command -v whisper-npu >/dev/null 2>&1; then
+    whisper-npu --start >>"${LOGFILE}" 2>&1 || return 1
+  else
+    return 1
+  fi
+}
+
+recording_pid() {
+  [[ -f "${PIDFILE}" ]] || return 1
+  local pid
+  pid=$(cat "${PIDFILE}" 2>/dev/null) || return 1
+  [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && printf '%s' "${pid}"
+}
+
+audio_metrics() {
+  python3 - "$1" <<'METRICS_EOF'
+import array, math, sys, wave
+try:
+    with wave.open(sys.argv[1], "rb") as w:
+        n, sr = w.getnframes(), w.getframerate()
+        raw = w.readframes(n)
+    a = array.array("h")
+    a.frombytes(raw[: len(raw) // 2 * 2])
+    if not a:
+        sys.exit(1)
+    rms = math.sqrt(sum(float(x) * x for x in a) / len(a)) / 32768
+    peak = max(abs(x) for x in a) / 32768
+    print(f"{n/sr:.2f} rms={rms:.5f} peak={peak:.4f}")
+except Exception:
+    sys.exit(1)
+METRICS_EOF
+}
+
+start_rec() {
+  if recording_pid >/dev/null; then
+    log "start ignored: already recording"
+    return 0
+  fi
+  rm -f "${RAW}" "${WAV}"
+  timeout "${MAX_SECS}" pw-record --rate 16000 --channels 1 --format s16 "${RAW}" \
+    >>"${LOGFILE}" 2>&1 &
+  echo $! >"${PIDFILE}"
+  state recording
+  log "recording started (pid $!)"
+  notify "recording..." 1200
+}
+
+stop_rec() {
+  local pid
+  if ! pid=$(recording_pid); then
+    log "stop ignored: not recording"
+    state idle
+    return 0
+  fi
+  kill -INT "${pid}" 2>/dev/null || true
+  wait "${pid}" 2>/dev/null || true
+  rm -f "${PIDFILE}"
+  state transcribing
+
+  if [[ ! -s "${RAW}" ]]; then
+    log "stop: no audio captured"
+    state idle
+    notify "no audio captured"
+    return 0
+  fi
+
+  # pw-record leaves the WAV length field stale when interrupted; normalise so the
+  # server sees a well-formed file and an honest duration.
+  if ! ffmpeg -nostdin -v error -y -i "${RAW}" -ar 16000 -ac 1 "${WAV}" >>"${LOGFILE}" 2>&1; then
+    log "ffmpeg normalise failed; posting raw capture"
+    cp -f "${RAW}" "${WAV}"
+  fi
+
+  # Reject taps too short to hold speech. This server does not return
+  # no_speech_prob (response_format=verbose_json yields {model,text} only) and
+  # large-v3-turbo hallucinates stock phrases on near-silence, so duration is the
+  # only cheap signal. RMS/peak are logged to calibrate a real gate later.
+  local metrics dur
+  metrics=$(audio_metrics "${WAV}") || metrics=""
+  if [[ -n "${metrics}" ]]; then
+    dur=${metrics%% *}
+    log "capture metrics: ${metrics}"
+    if awk -v d="${dur}" -v m="${MIN_SECS}" 'BEGIN{exit !(d < m)}'; then
+      log "discarded: ${dur}s is below the ${MIN_SECS}s floor"
+      state idle
+      notify "too short"
+      return 0
+    fi
+  fi
+
+  if ! ensure_server; then
+    log "ERROR: NPU ASR server unavailable"
+    state idle
+    notify "NPU server unavailable - see ${LOGFILE}" 5000
+    return 1
+  fi
+
+  local resp text
+  resp=$(curl -s --max-time 300 "${URL}/v1/audio/transcriptions" \
+    -F "file=@${WAV}" -F "model=${MODEL}" 2>>"${LOGFILE}") || true
+  text=$(printf '%s' "${resp}" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+t=d.get("text")
+print((t or "").strip())' 2>/dev/null) || true
+
+  if [[ -z "${text}" ]]; then
+    log "empty transcript; response: ${resp:0:200}"
+    state idle
+    notify "nothing transcribed"
+    return 0
+  fi
+
+  if [[ ${CLEAN} -eq 1 ]]; then
+    local cleaned
+    cleaned=$(clean_text "${text}") || cleaned=""
+    if [[ -n "${cleaned}" ]]; then
+      log "cleaned: ${text} -> ${cleaned}"
+      text="${cleaned}"
+    else
+      log "clean failed; keeping raw transcript"
+    fi
+  fi
+
+  log "transcript: ${text}"
+  type_out "${text}"
+  state idle
+}
+
+clean_text() {
+  local prompt='Fix only capitalization and punctuation in this dictation. Do not reword, do not translate, do not explain. Output only the corrected text.'
+  python3 - "${CLEAN_MODEL}" "${prompt}" "$1" "${URL}" <<'CLEAN_EOF'
+import json, sys, urllib.request
+model, prompt, text, url = sys.argv[1:5]
+body = json.dumps({"model": model,
+                   "messages": [{"role": "user", "content": prompt + "\n\n" + text}],
+                   "max_tokens": 512, "stream": False}).encode()
+req = urllib.request.Request(url + "/v1/chat/completions", data=body,
+                             headers={"Content-Type": "application/json"})
+try:
+    d = json.load(urllib.request.urlopen(req, timeout=120))
+    print((d["choices"][0]["message"]["content"] or "").strip())
+except Exception:
+    sys.exit(1)
+CLEAN_EOF
+}
+
+type_out() {
+  local text="$1"
+  if command -v wtype >/dev/null 2>&1; then
+    if wtype -d 1 -- "${text}" >>"${LOGFILE}" 2>&1; then
+      log "typed via wtype"
+      return 0
+    fi
+    log "wtype failed; falling back to clipboard"
+  fi
+  if command -v wl-copy >/dev/null 2>&1; then
+    printf '%s' "${text}" | wl-copy
+    log "copied via wl-copy"
+    notify "typing failed - text is in the clipboard" 4000
+    return 0
+  fi
+  log "ERROR: no way to output text"
+  notify "no output backend (need wtype or wl-copy)" 5000
+  return 1
+}
+
+CMD=""
+while (($#)); do
+  case "$1" in
+    --clean) CLEAN=1 ;;
+    --no-notify) NOTIFY=0 ;;
+    -h|--help) usage; exit 0 ;;
+    start|stop|toggle|cancel|status) CMD="$1" ;;
+    -*) printf 'error: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *) printf 'error: unknown command: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+case "${CMD}" in
+  start) ensure_server || true; start_rec ;;
+  stop) stop_rec ;;
+  toggle) if recording_pid >/dev/null; then stop_rec; else ensure_server || true; start_rec; fi ;;
+  cancel)
+    if pid=$(recording_pid); then
+      kill -INT "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+      rm -f "${PIDFILE}"
+      log "cancelled"
+      notify "cancelled" 1200
+    fi
+    rm -f "${RAW}" "${WAV}"
+    state idle
+    ;;
+  status) cat "${STATEFILE}" 2>/dev/null || echo idle; echo ;;
+  *) usage >&2; exit 1 ;;
+esac
