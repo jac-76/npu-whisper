@@ -102,7 +102,15 @@ npu 17 times 3 is 51.
 
 Commands: `/model NAME`, `/models`, `/voice NAME`, `/voices`, `/speak`,
 `/reset`, `/help`, `/quit`.
-Conversation history is kept across turns, so follow-ups work.
+Conversation history is kept across turns, so follow-ups work — and FastFlowLM
+reuses the prefix, reporting e.g. `Matched 8 out of 10 messages (2 new to
+prefill)`, so a long conversation does not re-cost the whole history each turn.
+
+The system prompt states what the assistant actually is — model id, that it runs
+on the NPU under FastFlowLM, the ASR model, and the piper voice — and is rebuilt
+when `/model`, `/voice` or `/speak` changes it. A 1B model cannot know any of
+that on its own, and "what model are you?" is a natural thing to ask by voice.
+It still garbles the supplied facts sometimes; it is a 1B model.
 
 One server serves both jobs. `flm serve --asr 1` answers
 `/v1/audio/transcriptions` *and* `/v1/chat/completions`, loading the LLM on

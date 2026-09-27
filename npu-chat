@@ -23,6 +23,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import wave
 
 PORT = int(os.environ.get("FLM_PORT", "52625"))
 URL = f"http://127.0.0.1:{PORT}"
@@ -40,6 +41,25 @@ SYSTEM_PROMPT = (
     "The user speaks to you, so keep replies short and conversational: "
     "two or three sentences unless asked for detail. Never use markdown."
 )
+
+
+def self_facts(model: str, voice: str | None) -> str:
+    """Tell the model what it actually is.
+
+    Small models cannot know their own identity or where they run, and asking
+    is a natural first thing to try by voice, so the truth is supplied rather
+    than guessed at.
+    """
+    bits = [
+        f"you are the model {model}, served by FastFlowLM on an AMD Ryzen AI 9 "
+        "365 (XDNA2) NPU",
+        "speech recognition is whisper-large-v3-turbo, also on the NPU",
+    ]
+    if voice:
+        bits.append(f"your voice is piper {voice}, which runs on the CPU")
+    else:
+        bits.append("you are not speaking out loud right now, replies are text only")
+    return " Facts about yourself, use them if asked: " + "; ".join(bits) + "."
 
 BOLD, DIM, CYAN, GREEN, YELLOW, RED, RESET = (
     "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
@@ -126,7 +146,24 @@ def record_until_enter() -> str | None:
          "-ar", "16000", "-ac", "1", wav],
         capture_output=True,
     )
-    return wav if norm.returncode == 0 and os.path.exists(wav) else raw
+    clip = wav if norm.returncode == 0 and os.path.exists(wav) else raw
+
+    # Wall-clock time between Enter presses is not the audio length: a capture
+    # that yields a header and no frames passes the check above and still
+    # reaches the server as 0.00s. Gate on what is actually in the file.
+    dur = wav_duration(clip)
+    if dur is not None and dur < MIN_SECS:
+        print(f"{YELLOW}only {dur:.2f}s of audio - discarded.{RESET}")
+        return None
+    return clip
+
+
+def wav_duration(path: str) -> float | None:
+    try:
+        with wave.open(path, "rb") as w:
+            return w.getnframes() / float(w.getframerate())
+    except Exception:
+        return None
 
 
 def transcribe(path: str) -> str:
@@ -316,7 +353,12 @@ def main() -> int:
               f"{' or '.join(VOICE_DIRS)}.{RESET}")
         speaking = False
 
-    history = [{"role": "system", "content": args.system}]
+    def system_msg() -> dict:
+        voice_id = (os.path.basename(voice_path)[:-5]
+                    if speaking and voice_path else None)
+        return {"role": "system", "content": args.system + self_facts(model, voice_id)}
+
+    history = [system_msg()]
 
     print(f"{BOLD}npu-chat{RESET} {DIM}- ASR and LLM both on the NPU via {URL}{RESET}")
     voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
@@ -339,7 +381,7 @@ def main() -> int:
             if cmd == "/help":
                 print(HELP)
             elif cmd == "/reset":
-                history = [{"role": "system", "content": args.system}]
+                history = [system_msg()]
                 print(f"{DIM}conversation cleared.{RESET}")
             elif cmd == "/models":
                 names = installed_models()
@@ -349,6 +391,7 @@ def main() -> int:
                     print(f"{DIM}current model: {model}{RESET}")
                 else:
                     model = rest
+                    history[0] = system_msg()
                     print(f"{DIM}model set to {model} "
                           f"(loads on first use){RESET}")
             elif cmd == "/speak":
@@ -358,6 +401,7 @@ def main() -> int:
                     print(f"{YELLOW}no voice loaded - use /voice NAME.{RESET}")
                 else:
                     speaking = not speaking
+                    history[0] = system_msg()
                     print(f"{DIM}spoken replies {'on' if speaking else 'off'}.{RESET}")
             elif cmd == "/voices":
                 names = available_voices()
@@ -373,6 +417,7 @@ def main() -> int:
                     else:
                         voice_path = found
                         speaking = tts_ready()
+                        history[0] = system_msg()
                         print(f"{DIM}voice set to {rest}.{RESET}")
             else:
                 print(f"{YELLOW}unknown command {cmd} - try /help{RESET}")
