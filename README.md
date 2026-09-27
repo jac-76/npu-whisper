@@ -130,6 +130,42 @@ Asked for the capital of Ohio and one thing it is known for, `qwen3:4b` invented
 woman". `gemma3:1b` is both faster and more accurate here, so it is the default.
 Replies stream, so first token lands in ~0.5–0.7 s.
 
+### Using an LLM the NPU cannot run (`--llm-url`)
+
+FastFlowLM only runs models it ships an NPU2 build for — 38 of them, and
+**Granite is not among them** (`flm pull granite4.2:3b` → "Model not found").
+More importantly for agent work, **FastFlowLM has no tool calling**: pass
+`tools` and it is silently ignored, and a small model will then *pretend* to
+call the tool and fabricate the result.
+
+So the LLM endpoint is separable. ASR stays on the NPU; point `--llm-url` at any
+OpenAI-compatible server:
+
+```sh
+# terminal 1 - granite on CPU + GPU, with real tool calling
+llama-server -m granite-4.2-3b-Q4_K_M.gguf --jinja --reasoning off   --host 127.0.0.1 --port 8080 -c 8192 -ngl 99
+
+# terminal 2 - speech on the NPU, generation from granite
+npu-chat --llm-url http://127.0.0.1:8080 --model granite
+```
+
+`--reasoning off` matters: granite 4.2 is a reasoning model and llama.cpp
+preserves thinking by default, which spent an entire 200-token budget on
+`reasoning_content` and returned `finish_reason: length` with empty `content`.
+With it off the answer comes straight back, and tool calls got faster too
+(1.39 s → 0.40 s).
+
+Measured on this box, same prompt, warm:
+
+| model | where | latency | tok/s | tool calls |
+|---|---|---|---|---|
+| `gemma3:1b` | NPU | 1.20 s | 40.2 | **no** (silently ignored) |
+| `granite-4.2-3b` Q4_K_M | CPU + RTX 4070 | **0.22 s** | **94.3** | **yes** (`finish_reason=tool_calls`) |
+
+The system prompt tracks this honestly — with `--llm-url` set, the assistant is
+told it runs on the CPU and GPU rather than the NPU, so asking it where it runs
+still gets a true answer.
+
 ### Session transcripts
 
 Every session is written to `~/.local/state/npu-chat/<timestamp>.{md,jsonl}` —

@@ -153,3 +153,18 @@ def test_chat_declares_trim_threshold():
     src = open("npu-chat").read()
     assert "NPU_CHAT_TRIM_DB" in src
     assert "silenceremove" in src
+
+
+def test_chat_llm_url_is_separable():
+    """ASR must stay on the NPU while the LLM can live elsewhere."""
+    out = subprocess.run(
+        [sys.executable, "npu-chat", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--llm-url" in out.stdout
+    src = open("npu-chat").read()
+    assert "LLM_URL" in src
+    # ASR endpoint must not be repointed by --llm-url
+    assert 'f"{URL}/v1/audio/transcriptions"' in src
