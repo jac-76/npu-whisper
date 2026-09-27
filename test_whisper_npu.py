@@ -115,3 +115,41 @@ def test_chat_rejects_unknown_flag():
 def test_chat_recorder_and_ffmpeg_present():
     assert shutil.which("pw-record"), "npu-chat records with pw-record (pipewire)"
     assert shutil.which("ffmpeg"), "npu-chat normalises captures with ffmpeg"
+
+
+def test_chat_no_transcript_flag_exists():
+    out = subprocess.run(
+        [sys.executable, "npu-chat", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--no-transcript" in out.stdout
+    assert "--no-speak" in out.stdout
+    assert "--voice" in out.stdout
+
+
+def test_chat_cleans_up_on_sigterm():
+    """atexit does not run on signals; a handler must remove the session dir."""
+    import glob
+    import signal as sig
+    import time as t
+
+    before = set(glob.glob("/tmp/npu-chat-*"))
+    proc = subprocess.Popen(
+        [sys.executable, "npu-chat", "--no-speak", "--no-transcript"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    t.sleep(2)
+    proc.send_signal(sig.SIGTERM)
+    proc.wait(timeout=15)
+    t.sleep(0.5)
+    assert set(glob.glob("/tmp/npu-chat-*")) <= before
+
+
+def test_chat_declares_trim_threshold():
+    src = open("npu-chat").read()
+    assert "NPU_CHAT_TRIM_DB" in src
+    assert "silenceremove" in src

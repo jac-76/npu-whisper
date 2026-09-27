@@ -31,6 +31,15 @@ ASR_MODEL = os.environ.get("FLM_ASR_MODEL", "whisper-v3")
 DEFAULT_LLM = os.environ.get("NPU_CHAT_MODEL", "gemma3:1b")
 MIN_SECS = float(os.environ.get("NPU_CHAT_MIN_SECS", "0.4"))
 DEFAULT_VOICE = os.environ.get("NPU_CHAT_VOICE", "en_GB-alan-medium")
+# Silence threshold for trimming dead air off a capture. Measured on this box:
+# room noise sits at about -19.5 dBFS and speech at -18.3, so the two overlap
+# badly -- but silenceremove works on short windows, and the transcript survived
+# every threshold tried (-40, -30, -25, -20 dB) on a padded sample. -30 dB is
+# the conservative default; -25 dB cuts far more if you want it.
+TRIM_DB = os.environ.get("NPU_CHAT_TRIM_DB", "-30dB")
+LOGDIR = os.path.expanduser(
+    os.environ.get("NPU_CHAT_LOGDIR", "~/.local/state/npu-chat")
+)
 VOICE_DIRS = (
     os.path.expanduser("~/.local/share/piper"),
     os.path.expanduser("~/.local/share/piper-voices"),
@@ -69,13 +78,68 @@ BOLD, DIM, CYAN, GREEN, YELLOW, RED, RESET = (
 _SESSION_DIR: str | None = None
 
 
+def _cleanup() -> None:
+    if _SESSION_DIR:
+        shutil.rmtree(_SESSION_DIR, ignore_errors=True)
+
+
+def _cleanup_and_die(signum, _frame):
+    # atexit does not run on SIGHUP/SIGTERM, so closing the terminal used to
+    # leave the whole session dir behind. Clean up, then exit properly.
+    _cleanup()
+    sys.exit(128 + signum)
+
+
 def session_dir() -> str:
     """One temp dir per run, removed at exit, instead of one per turn."""
     global _SESSION_DIR
     if _SESSION_DIR is None:
         _SESSION_DIR = tempfile.mkdtemp(prefix="npu-chat-")
-        atexit.register(shutil.rmtree, _SESSION_DIR, True)
+        atexit.register(_cleanup)
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            try:
+                signal.signal(sig, _cleanup_and_die)
+            except (ValueError, OSError):
+                pass
     return _SESSION_DIR
+
+
+class Transcript:
+    """Append-only record of a session: JSONL for tools, .md for reading.
+
+    Neither npu-chat nor the server kept reply text before this -- FastFlowLM
+    logs only the final stream chunk, whose content is null -- so a finished
+    conversation left nothing behind.
+    """
+
+    def __init__(self, path_stem: str) -> None:
+        self.jsonl = path_stem + ".jsonl"
+        self.md = path_stem + ".md"
+        self._started = False
+
+    def _start(self, meta: dict) -> None:
+        with open(self.md, "a", encoding="utf-8") as fh:
+            fh.write(f"# npu-chat session {meta['started']}\n\n")
+            fh.write(f"- model: `{meta['model']}`\n")
+            fh.write(f"- voice: `{meta['voice'] or 'none (text only)'}`\n")
+            fh.write(f"- server: {meta['server']}\n\n")
+        self._started = True
+
+    def turn(self, meta: dict, **fields) -> None:
+        if not self._started:
+            self._start(meta)
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), **fields}
+        with open(self.jsonl, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        with open(self.md, "a", encoding="utf-8") as fh:
+            if fields.get("user") is not None:
+                via = fields.get("via", "text")
+                extra = ""
+                if fields.get("audio_secs"):
+                    extra = f" _({fields['audio_secs']:.1f}s audio)_"
+                fh.write(f"**you** ({via}){extra}: {fields['user']}\n\n")
+            if fields.get("assistant") is not None:
+                fh.write(f"**npu**: {fields['assistant']}\n\n")
 
 
 def supports_color() -> bool:
@@ -148,6 +212,25 @@ def record_until_enter() -> str | None:
     )
     clip = wav if norm.returncode == 0 and os.path.exists(wav) else raw
 
+    # Enter-to-start/Enter-to-stop records while the user thinks, so most of a
+    # capture is dead air. Trimming it cuts what the NPU has to chew on; the
+    # transcript was identical with and without on every threshold tested.
+    trimmed = os.path.join(tmp, "trim.wav")
+    cut = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", clip, "-af",
+         f"silenceremove=start_periods=1:start_duration=0.1:"
+         f"start_threshold={TRIM_DB}:stop_periods=-1:stop_duration=0.4:"
+         f"stop_threshold={TRIM_DB}", "-ar", "16000", "-ac", "1", trimmed],
+        capture_output=True,
+    )
+    if cut.returncode == 0:
+        before, after = wav_duration(clip), wav_duration(trimmed)
+        # Never hand over an empty clip just because the trim was greedy.
+        if after and after >= MIN_SECS:
+            if before:
+                print(f"{DIM}trimmed {before:.1f}s -> {after:.1f}s{RESET}")
+            clip = trimmed
+
     # Wall-clock time between Enter presses is not the audio length: a capture
     # that yields a header and no frames passes the check above and still
     # reaches the server as 0.00s. Gate on what is actually in the file.
@@ -195,7 +278,7 @@ def transcribe(path: str) -> str:
     return (d.get("text") or "").strip()
 
 
-def stream_reply(model: str, history: list[dict]) -> str:
+def stream_reply(model: str, history: list[dict]) -> tuple[str, float | None, float]:
     """Stream a chat completion from the NPU, printing tokens as they arrive."""
     body = json.dumps(
         {"model": model, "messages": history, "max_tokens": 512, "stream": True}
@@ -232,14 +315,15 @@ def stream_reply(model: str, history: list[dict]) -> str:
                 sys.stdout.flush()
     except Exception as exc:
         print(f"\n{RED}generation failed: {exc}{RESET}")
-        return ""
+        return "", None, time.time() - start
     reply = "".join(out).strip()
+    total = time.time() - start
     if reply:
         ttft = f"{first:.2f}s" if first is not None else "n/a"
-        print(f"\n{DIM}[{model} - first token {ttft}, total {time.time()-start:.2f}s]{RESET}")
+        print(f"\n{DIM}[{model} - first token {ttft}, total {total:.2f}s]{RESET}")
     else:
         print(f"{YELLOW}(empty reply){RESET}")
-    return reply
+    return reply, first, total
 
 
 def find_voice(name: str) -> str | None:
@@ -336,6 +420,8 @@ def main() -> int:
     ap.add_argument("--voice", default=DEFAULT_VOICE,
                     help=f"piper voice id or .onnx path (default {DEFAULT_VOICE})")
     ap.add_argument("--system", default=SYSTEM_PROMPT, help="override the system prompt")
+    ap.add_argument("--no-transcript", action="store_true",
+                    help=f"do not write a session transcript under {LOGDIR}")
     args = ap.parse_args()
 
     if not ensure_server():
@@ -360,11 +446,29 @@ def main() -> int:
 
     history = [system_msg()]
 
+    transcript = None
+    if not args.no_transcript:
+        os.makedirs(LOGDIR, exist_ok=True)
+        stem = os.path.join(LOGDIR, time.strftime("%Y-%m-%dT%H-%M-%S"))
+        transcript = Transcript(stem)
+
+    def meta() -> dict:
+        return {
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "model": model,
+            "voice": (os.path.basename(voice_path)[:-5]
+                      if speaking and voice_path else None),
+            "server": URL,
+        }
+
     print(f"{BOLD}npu-chat{RESET} {DIM}- ASR and LLM both on the NPU via {URL}{RESET}")
     voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
                   if speaking and voice_path else "voice off")
     print(f"{DIM}model {model} | {voice_note} | press Enter to talk, "
-          f"/help for commands{RESET}\n")
+          f"/help for commands{RESET}")
+    if transcript:
+        print(f"{DIM}transcript: {transcript.md}{RESET}")
+    print()
 
     while True:
         try:
@@ -423,27 +527,36 @@ def main() -> int:
                 print(f"{YELLOW}unknown command {cmd} - try /help{RESET}")
             continue
 
+        audio_secs = None
+        via = "text"
         if line == "":
             clip = record_until_enter()
             if not clip:
                 continue
+            audio_secs = wav_duration(clip)
             said = transcribe(clip)
             if not said:
                 print(f"{YELLOW}nothing transcribed.{RESET}")
                 continue
             print(f"{CYAN}{BOLD}you{RESET} {said}")
             user_text = said
+            via = "voice"
         else:
             user_text = line
 
         history.append({"role": "user", "content": user_text})
-        reply = stream_reply(model, history)
+        reply, ttft, total = stream_reply(model, history)
         if reply:
             history.append({"role": "assistant", "content": reply})
             if speaking and voice_path:
                 speak(reply, voice_path)
         else:
             history.pop()
+        if transcript:
+            transcript.turn(meta(), via=via, user=user_text, assistant=reply or None,
+                            audio_secs=audio_secs, model=model,
+                            ttft_secs=round(ttft, 3) if ttft else None,
+                            total_secs=round(total, 3))
         print()
 
 

@@ -130,6 +130,39 @@ Asked for the capital of Ohio and one thing it is known for, `qwen3:4b` invented
 woman". `gemma3:1b` is both faster and more accurate here, so it is the default.
 Replies stream, so first token lands in ~0.5–0.7 s.
 
+### Session transcripts
+
+Every session is written to `~/.local/state/npu-chat/<timestamp>.{md,jsonl}` —
+the Markdown to read, the JSONL for tooling, both with per-turn `ttft_secs`,
+`total_secs`, `audio_secs` and the model used. `--no-transcript` turns it off.
+
+This exists because nothing else kept the conversation: FastFlowLM logs only the
+final stream chunk, whose `content` is `null`, so a 12-turn session left twelve
+log lines and zero recoverable replies.
+
+### Dead-air trimming
+
+Enter-to-start/Enter-to-stop means recording runs while you think, so most of a
+capture is silence. Captures are trimmed with ffmpeg `silenceremove` before
+transcription — measured live, 6.9 s → 3.9 s.
+
+The threshold is `NPU_CHAT_TRIM_DB` (default `-30dB`). It matters that this was
+checked rather than assumed, because this microphone's noise floor is loud: room
+noise measures about **-19.5 dBFS** against speech at **-18.3**, barely 1.2 dB
+apart. On a padded sample (4 s noise + 1.1 s speech + 4 s noise) the transcript
+came back identical at every threshold tried:
+
+| threshold | 9.05 s becomes | transcript |
+|---|---|---|
+| `-40dB` | 8.95 s | `How are you today?` |
+| `-30dB` (default) | 6.77 s | `How are you today?` |
+| `-25dB` | 3.08 s | `How are you today?` |
+| `-20dB` | 2.68 s | `How are you today?` |
+
+`-30dB` is the conservative default; set `-25dB` for a much bigger cut. A trim
+that would leave less than `NPU_CHAT_MIN_SECS` of audio is discarded and the
+untrimmed clip is used.
+
 ### Spoken replies: piper, on the CPU
 
 Replies are spoken by default with [piper](https://github.com/rhasspy/piper)
