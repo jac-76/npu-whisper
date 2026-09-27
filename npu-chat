@@ -15,6 +15,7 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -32,7 +33,11 @@ URL = f"http://127.0.0.1:{PORT}"
 # no NPU build of. Set with --llm-url.
 LLM_URL = URL
 ASR_MODEL = os.environ.get("FLM_ASR_MODEL", "whisper-v3")
-DEFAULT_LLM = os.environ.get("NPU_CHAT_MODEL", "gemma3:1b")
+# qwen3.5:4b over gemma3:1b on measurement: gemma3:1b answered a two-step word
+# problem ("5 apples, eat 2, buy 4 more") wrong 5 times out of 5, always dropping
+# the last clause. qwen3.5:4b got it right 5/5. It is ~2x slower per reply
+# (2.6s vs 1.3s) and still fast enough to talk to.
+DEFAULT_LLM = os.environ.get("NPU_CHAT_MODEL", "qwen3.5:4b")
 MIN_SECS = float(os.environ.get("NPU_CHAT_MIN_SECS", "0.4"))
 DEFAULT_VOICE = os.environ.get("NPU_CHAT_VOICE", "en_GB-alan-medium")
 # Silence threshold for trimming dead air off a capture. Measured on this box:
@@ -367,13 +372,33 @@ def tts_ready() -> bool:
     return bool(shutil.which("piper-tts")) and bool(shutil.which("pw-play"))
 
 
+def for_speech(text: str) -> str:
+    """Strip markup that a synthesiser would read out loud.
+
+    piper pronounces the characters: "You now have **7** apples." came out as
+    "You now have asterisk-sterisk-seven asterisk-ster apples", 4.23s instead of
+    1.96s. Models emit markdown even when the system prompt forbids it.
+    """
+    t = text
+    t = re.sub(r"```[\s\S]*?```", " ", t)          # fenced code
+    t = re.sub(r"`([^`]*)`", r"\1", t)              # inline code
+    t = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", t)  # links/images
+    t = re.sub(r"(\*\*|__)(.*?)\1", r"\2", t)      # bold
+    t = re.sub(r"(?<!\w)[*_](\S(?:.*?\S)?)[*_](?!\w)", r"\1", t)  # italics
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.M)  # headings
+    t = re.sub(r"^\s*[-*+]\s+", "", t, flags=re.M)       # bullets
+    t = re.sub(r"^\s*>\s?", "", t, flags=re.M)           # quotes
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
+
+
 def speak(text: str, voice_path: str) -> None:
     """Synthesise with piper-tts and play through the default sink.
 
     Do NOT pass --output-raw: it redirects audio to stdout and leaves -f empty,
     so playback gets silence. This bit us before.
     """
-    text = text.strip()
+    text = for_speech(text)
     if not text:
         return
     wav = os.path.join(session_dir(), "reply.wav")

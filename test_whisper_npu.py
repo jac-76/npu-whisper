@@ -168,3 +168,34 @@ def test_chat_llm_url_is_separable():
     assert "LLM_URL" in src
     # ASR endpoint must not be repointed by --llm-url
     assert 'f"{URL}/v1/audio/transcriptions"' in src
+
+
+def _load_chat():
+    """Import npu-chat as a module despite having no .py extension."""
+    import types
+
+    mod = types.ModuleType("npu_chat")
+    mod.__dict__["__name__"] = "npu_chat"
+    exec(compile(open("npu-chat").read(), "npu-chat", "exec"), mod.__dict__)
+    return mod
+
+
+def test_for_speech_strips_markup_piper_would_pronounce():
+    """piper says "asterisk-sterisk-seven" for **7**, so markup must go."""
+    m = _load_chat()
+    assert m.for_speech("You now have **7** apples.") == "You now have 7 apples."
+    assert m.for_speech("Use `ls -la` to list.") == "Use ls -la to list."
+    assert m.for_speech("# Heading\nbody") == "Heading\nbody"
+    assert m.for_speech("- one\n- two") == "one\ntwo"
+    assert m.for_speech("See [the docs](http://x.y) now.") == "See the docs now."
+    assert m.for_speech("That is *very* good.") == "That is very good."
+
+
+def test_for_speech_keeps_underscores_in_identifiers():
+    m = _load_chat()
+    assert m.for_speech("snake_case_name stays") == "snake_case_name stays"
+
+
+def test_default_model_is_the_benchmarked_one():
+    m = _load_chat()
+    assert m.DEFAULT_LLM == "qwen3.5:4b"

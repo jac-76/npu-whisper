@@ -118,17 +118,32 @@ first use (~2.3 s) with no restart; the NPU lock serialises the two.
 
 ### Model choice
 
-Measured on this box, same prompt, warm:
+Default is **`qwen3.5:4b`**, chosen on measurement. Three FastFlowLM models, same
+prompts, warm, 3 runs each:
 
-| model | latency | result |
-|---|---|---|
-| **`gemma3:1b`** (default) | **1.37 s**, 39.4 tok/s | correct |
-| `qwen3:4b` | 9.94 s, 19.4 tok/s | factually wrong |
+| model | factual | arithmetic | two-step word problem | tok/s |
+|---|---|---|---|---|
+| **`qwen3.5:4b`** (default) | 2.59 s ✅ | 1.28 s ✅ | 2.18 s **✅ 5/5** | 14.2 |
+| `gemma3:1b` | 1.32 s ✅ | 0.79 s ✅ | 0.75 s **❌ 0/5** | 39.6 |
+| `qwen3:4b` | 8.93 s ✅ | 8.33 s ❌ leaks `<think>` | 7.18 s ✅ | 19.3 |
 
-Asked for the capital of Ohio and one thing it is known for, `qwen3:4b` invented
-"the Columbus Monument, a historic landmark featuring a massive statue of a
-woman". `gemma3:1b` is both faster and more accurate here, so it is the default.
-Replies stream, so first token lands in ~0.5–0.7 s.
+The word problem is *"I have 5 apples, eat 2, then buy 4 more. How many do I
+have?"* (answer 7). `gemma3:1b` answered **"You have 3 apples left"** five times
+out of five — it drops the final clause every time. `qwen3.5:4b` got it right
+five times out of five. Being 2× slower per reply and still under three seconds
+is the better trade for something you talk to.
+
+`qwen3:4b` is worth avoiding: it leaks raw `<think>` blocks into `content` and
+burned a 200-token budget mid-thought on `17 × 3`.
+
+### Markdown is stripped before speaking
+
+Models emit markdown even when told not to, and piper pronounces it:
+`"You now have **7** apples."` is spoken as *"You now have asterisk-sterisk-seven
+asterisk-ster apples"* — 4.23 s of audio instead of 1.96 s. `for_speech()`
+removes bold, italics, code, headings, bullets, quotes and link syntax before
+synthesis, while leaving `snake_case` identifiers alone. Printed text and the
+transcript keep the model's raw output.
 
 ### Using an LLM the NPU cannot run (`--llm-url`)
 
