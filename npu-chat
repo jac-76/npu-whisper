@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Voice chat with an LLM on the AMD Ryzen AI NPU.
+
+Speech recognition (whisper-large-v3-turbo) and generation (an LLM of your
+choice) both run on the NPU through one FastFlowLM server. Recording,
+resampling and optional speech synthesis use a little CPU.
+
+Push to talk is Enter: press Enter to start recording, Enter again to stop.
+Typing a line sends it as text instead.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+PORT = int(os.environ.get("FLM_PORT", "52625"))
+URL = f"http://127.0.0.1:{PORT}"
+ASR_MODEL = os.environ.get("FLM_ASR_MODEL", "whisper-v3")
+DEFAULT_LLM = os.environ.get("NPU_CHAT_MODEL", "gemma3:1b")
+MIN_SECS = float(os.environ.get("NPU_CHAT_MIN_SECS", "0.4"))
+
+SYSTEM_PROMPT = (
+    "You are a helpful voice assistant running locally on a laptop NPU. "
+    "The user speaks to you, so keep replies short and conversational: "
+    "two or three sentences unless asked for detail. Never use markdown."
+)
+
+BOLD, DIM, CYAN, GREEN, YELLOW, RED, RESET = (
+    "\033[1m", "\033[2m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m"
+)
+
+
+def supports_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("TERM") not in (None, "dumb")
+
+
+if not supports_color():
+    BOLD = DIM = CYAN = GREEN = YELLOW = RED = RESET = ""
+
+
+def server_up() -> bool:
+    try:
+        urllib.request.urlopen(f"{URL}/v1/models", timeout=2).read()
+        return True
+    except Exception:
+        return False
+
+
+def ensure_server() -> bool:
+    if server_up():
+        return True
+    if not shutil.which("whisper-npu"):
+        print(f"{RED}NPU server is down and whisper-npu is not on PATH.{RESET}")
+        print(f"{DIM}Start it manually: flm serve --asr 1{RESET}")
+        return False
+    print(f"{DIM}starting NPU server (loading whisper + LLM on demand)...{RESET}")
+    rc = subprocess.run(["whisper-npu", "--start"], capture_output=True).returncode
+    return rc == 0 and server_up()
+
+
+def record_until_enter() -> str | None:
+    """Record from the default source until the user presses Enter."""
+    if not shutil.which("pw-record"):
+        print(f"{RED}pw-record not found (install pipewire-audio).{RESET}")
+        return None
+    tmp = tempfile.mkdtemp(prefix="npu-chat-")
+    raw = os.path.join(tmp, "raw.wav")
+    proc = subprocess.Popen(
+        ["pw-record", "--rate", "16000", "--channels", "1", "--format", "s16", raw],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    print(f"{RED}● recording{RESET} {DIM}- press Enter to stop{RESET}", end="", flush=True)
+    started = time.time()
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    held = time.time() - started
+    print(f"\r\033[K{DIM}captured {held:.1f}s{RESET}")
+
+    if not os.path.exists(raw) or os.path.getsize(raw) == 0:
+        print(f"{YELLOW}no audio captured.{RESET}")
+        return None
+    if held < MIN_SECS:
+        print(f"{YELLOW}too short ({held:.2f}s) - discarded.{RESET}")
+        return None
+
+    # pw-record leaves a stale length field when interrupted; normalise it.
+    wav = os.path.join(tmp, "rec.wav")
+    norm = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", raw,
+         "-ar", "16000", "-ac", "1", wav],
+        capture_output=True,
+    )
+    return wav if norm.returncode == 0 and os.path.exists(wav) else raw
+
+
+def transcribe(path: str) -> str:
+    """POST the clip to the NPU ASR endpoint (multipart, stdlib only)."""
+    boundary = "----npuchat" + str(int(time.time() * 1000))
+    with open(path, "rb") as fh:
+        audio = fh.read()
+    parts = [
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="file"; filename="clip.wav"\r\n',
+        b"Content-Type: audio/wav\r\n\r\n",
+        audio,
+        f"\r\n--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="model"\r\n\r\n',
+        ASR_MODEL.encode(),
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"{URL}/v1/audio/transcriptions",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=300).read())
+    except Exception as exc:
+        print(f"{RED}transcription failed: {exc}{RESET}")
+        return ""
+    return (d.get("text") or "").strip()
+
+
+def stream_reply(model: str, history: list[dict]) -> str:
+    """Stream a chat completion from the NPU, printing tokens as they arrive."""
+    body = json.dumps(
+        {"model": model, "messages": history, "max_tokens": 512, "stream": True}
+    ).encode()
+    req = urllib.request.Request(
+        f"{URL}/v1/chat/completions",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    out: list[str] = []
+    first: float | None = None
+    start = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            print(f"{GREEN}{BOLD}npu{RESET} ", end="", flush=True)
+            for line in resp:
+                text = line.decode("utf-8", "replace").strip()
+                if not text.startswith("data:"):
+                    continue
+                payload = text[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                delta = chunk["choices"][0].get("delta", {}).get("content")
+                if not delta:
+                    continue
+                if first is None:
+                    first = time.time() - start
+                out.append(delta)
+                sys.stdout.write(delta)
+                sys.stdout.flush()
+    except Exception as exc:
+        print(f"\n{RED}generation failed: {exc}{RESET}")
+        return ""
+    reply = "".join(out).strip()
+    if reply:
+        ttft = f"{first:.2f}s" if first is not None else "n/a"
+        print(f"\n{DIM}[{model} - first token {ttft}, total {time.time()-start:.2f}s]{RESET}")
+    else:
+        print(f"{YELLOW}(empty reply){RESET}")
+    return reply
+
+
+def speak(text: str) -> None:
+    if not shutil.which("espeak-ng"):
+        return
+    subprocess.Popen(
+        ["espeak-ng", "-s", "165", text],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+HELP = f"""{BOLD}Commands{RESET}
+  {CYAN}Enter{RESET}          push to talk - press Enter to start, Enter to stop
+  type a line    send it as text instead of speaking
+  {CYAN}/model NAME{RESET}    switch LLM (e.g. /model qwen3:4b)
+  {CYAN}/models{RESET}        list models installed on this box
+  {CYAN}/speak{RESET}         toggle spoken replies (needs espeak-ng)
+  {CYAN}/reset{RESET}         clear the conversation
+  {CYAN}/help{RESET}          this list
+  {CYAN}/quit{RESET}          exit"""
+
+
+def installed_models() -> list[str]:
+    if not shutil.which("flm"):
+        return []
+    out = subprocess.run(["flm", "list"], capture_output=True, text=True)
+    names = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("- ") and "✅" in line:
+            names.append(line[2:].split()[0])
+    return names
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Voice chat with an LLM on the AMD NPU (FastFlowLM).",
+        epilog="Push to talk is Enter: press Enter to start recording, Enter again to stop.",
+    )
+    ap.add_argument("--model", default=DEFAULT_LLM,
+                    help=f"LLM to chat with (default {DEFAULT_LLM})")
+    ap.add_argument("--speak", action="store_true",
+                    help="speak replies with espeak-ng (CPU; install it separately)")
+    ap.add_argument("--system", default=SYSTEM_PROMPT, help="override the system prompt")
+    args = ap.parse_args()
+
+    if not ensure_server():
+        return 1
+
+    model = args.model
+    speaking = args.speak
+    if speaking and not shutil.which("espeak-ng"):
+        print(f"{YELLOW}--speak ignored: espeak-ng is not installed "
+              f"(sudo pacman -S espeak-ng).{RESET}")
+        speaking = False
+
+    history = [{"role": "system", "content": args.system}]
+
+    print(f"{BOLD}npu-chat{RESET} {DIM}- ASR and LLM both on the NPU via {URL}{RESET}")
+    print(f"{DIM}model {model} | press Enter to talk, /help for commands{RESET}\n")
+
+    while True:
+        try:
+            line = input(f"{CYAN}{BOLD}you{RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+
+        if line.startswith("/"):
+            cmd, _, rest = line.partition(" ")
+            cmd, rest = cmd.lower(), rest.strip()
+            if cmd in ("/quit", "/exit", "/q"):
+                return 0
+            if cmd == "/help":
+                print(HELP)
+            elif cmd == "/reset":
+                history = [{"role": "system", "content": args.system}]
+                print(f"{DIM}conversation cleared.{RESET}")
+            elif cmd == "/models":
+                names = installed_models()
+                print(f"{DIM}installed: {', '.join(names) if names else 'unknown'}{RESET}")
+            elif cmd == "/model":
+                if not rest:
+                    print(f"{DIM}current model: {model}{RESET}")
+                else:
+                    model = rest
+                    print(f"{DIM}model set to {model} "
+                          f"(loads on first use){RESET}")
+            elif cmd == "/speak":
+                if not shutil.which("espeak-ng"):
+                    print(f"{YELLOW}espeak-ng is not installed "
+                          f"(sudo pacman -S espeak-ng).{RESET}")
+                else:
+                    speaking = not speaking
+                    print(f"{DIM}spoken replies {'on' if speaking else 'off'}.{RESET}")
+            else:
+                print(f"{YELLOW}unknown command {cmd} - try /help{RESET}")
+            continue
+
+        if line == "":
+            clip = record_until_enter()
+            if not clip:
+                continue
+            said = transcribe(clip)
+            if not said:
+                print(f"{YELLOW}nothing transcribed.{RESET}")
+                continue
+            print(f"{CYAN}{BOLD}you{RESET} {said}")
+            user_text = said
+        else:
+            user_text = line
+
+        history.append({"role": "user", "content": user_text})
+        reply = stream_reply(model, history)
+        if reply:
+            history.append({"role": "assistant", "content": reply})
+            if speaking:
+                speak(reply)
+        else:
+            history.pop()
+        print()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

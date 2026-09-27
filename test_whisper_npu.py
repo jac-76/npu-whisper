@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import sys
 
 
 def test_syntax():
@@ -83,3 +84,34 @@ def test_dictate_output_backend_present():
 
 def test_dictate_recorder_present():
     assert shutil.which("pw-record"), "npu-dictate records with pw-record (pipewire)"
+
+
+def test_chat_compiles():
+    subprocess.run(
+        [sys.executable, "-m", "py_compile", "npu-chat"], check=True
+    )
+
+
+def test_chat_help_exits_zero():
+    out = subprocess.run(
+        [sys.executable, "npu-chat", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--model" in out.stdout
+    assert "Enter" in out.stdout
+
+
+def test_chat_rejects_unknown_flag():
+    out = subprocess.run(
+        [sys.executable, "npu-chat", "--nope"],
+        capture_output=True,
+        text=True,
+    )
+    assert out.returncode != 0
+
+
+def test_chat_recorder_and_ffmpeg_present():
+    assert shutil.which("pw-record"), "npu-chat records with pw-record (pipewire)"
+    assert shutil.which("ffmpeg"), "npu-chat normalises captures with ffmpeg"

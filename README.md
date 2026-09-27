@@ -1,9 +1,11 @@
 # npu-whisper
 
-One-shot **Whisper ASR on the AMD Ryzen AI NPU** — a zero-dependency Bash wrapper
-that starts the [FastFlowLM](https://fastflowlm.com/) ASR server on demand and
-transcribes audio over its OpenAI-compatible API. Everything runs locally on the
-NPU; nothing leaves the machine.
+**Whisper ASR on the AMD Ryzen AI NPU**, three ways: one-shot file
+transcription (`whisper-npu`), push-to-talk dictation into any window
+(`npu-dictate`), and a voice chat whose LLM also runs on the NPU (`npu-chat`).
+All of them drive a [FastFlowLM](https://fastflowlm.com/) server over its
+OpenAI-compatible API, started on demand. Everything runs locally; nothing
+leaves the machine.
 
 Verified on a **MSI Stealth A16 AI+** (AMD Ryzen AI 9 365, XDNA2 NPU, 8 columns)
 under Omarchy/Arch Linux.
@@ -75,6 +77,62 @@ any of them — it's on the NPU.
 threads): ~6.8 s, **~400 J per transcription over idle** — roughly **10× the
 NPU's energy** for a ~25 % slower result. See `bench_cpu.py --help` for setup
 (build whisper.cpp from source; the Arch package's ggml backend is broken).
+
+## Voice chat on the NPU (`npu-chat`)
+
+`npu-chat` is a terminal voice assistant where **both halves run on the NPU**:
+speech recognition with `whisper-large-v3-turbo` and generation with an LLM, over
+the same FastFlowLM server. **Push to talk is Enter** — press Enter to start
+recording, Enter again to stop. Typing a line sends it as text instead.
+
+```sh
+install -m755 npu-chat ~/.local/bin/
+npu-chat                       # default model
+npu-chat --model qwen3:4b      # pick another
+npu-chat --speak               # also speak replies (needs espeak-ng)
+```
+
+```
+you ● recording - press Enter to stop
+you What is 17 times 3?
+npu 17 times 3 is 51.
+[gemma3:1b - first token 0.66s, total 0.96s]
+```
+
+Commands: `/model NAME`, `/models`, `/speak`, `/reset`, `/help`, `/quit`.
+Conversation history is kept across turns, so follow-ups work.
+
+One server serves both jobs. `flm serve --asr 1` answers
+`/v1/audio/transcriptions` *and* `/v1/chat/completions`, loading the LLM on
+first use (~2.3 s) with no restart; the NPU lock serialises the two.
+
+### Model choice
+
+Measured on this box, same prompt, warm:
+
+| model | latency | result |
+|---|---|---|
+| **`gemma3:1b`** (default) | **1.37 s**, 39.4 tok/s | correct |
+| `qwen3:4b` | 9.94 s, 19.4 tok/s | factually wrong |
+
+Asked for the capital of Ohio and one thing it is known for, `qwen3:4b` invented
+"the Columbus Monument, a historic landmark featuring a massive statue of a
+woman". `gemma3:1b` is both faster and more accurate here, so it is the default.
+Replies stream, so first token lands in ~0.5–0.7 s.
+
+### Spoken replies are optional and not on the NPU
+
+FastFlowLM has no TTS, and no speech synthesiser ships on this box. `--speak`
+uses `espeak-ng` (`extra`, CPU) when it is installed and is ignored otherwise;
+`piper-tts` is not in the configured repos. Everything else — recognition and
+generation — stays on the NPU.
+
+### Same hallucination caveat
+
+`npu-chat` shows you the transcript before it sends anything, so a bad
+recognition is visible rather than silent. See the `npu-dictate` section below
+for why non-speech audio produces invented sentences and why no gate is
+available.
 
 ## Push-to-talk dictation (`npu-dictate`)
 
