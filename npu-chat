@@ -494,13 +494,526 @@ def installed_models() -> list[str]:
     return names
 
 
+# --- voice -> coding agent (--harness claude) --------------------------------
+# Claude Code runs as one long-lived process (stream-json in and out) against a
+# local ollama model. Everything below was built on captured output, not on
+# docs; the fixtures in tests/ are that capture.
+
+HARNESS_MODEL = os.environ.get("NPU_CHAT_HARNESS_MODEL", "qwen3.5:4b-64k")
+# Claude Code thrashed on autocompact at 32k in every multi-step task tried;
+# at 64k it did not once. It must be told the real window or it assumes 200k.
+HARNESS_CTX = os.environ.get("NPU_CHAT_HARNESS_CTX", "65536")
+HARNESS_TIMEOUT = float(os.environ.get("NPU_CHAT_HARNESS_TIMEOUT", "600"))
+VOICE_RULES = (
+    "You are driven by voice: the user speaks, and your final reply is read "
+    "aloud. End every turn with one to three plain sentences saying what you "
+    "found or changed. No markdown, no code blocks, no file listings in the "
+    "final reply; the user reviews edits with git diff."
+)
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+
+
+def agent_prompt(allow: list[str]) -> str:
+    """Voice rules plus the exact shell commands the allowlist permits.
+
+    Without the list the model guessed `python -m pytest` instead of the
+    allowed `.venv/bin/python -m pytest` and was refused ten times in one turn.
+    """
+    cmds = [m.group(1).replace(":*", " <args>")
+            for r in allow if (m := re.fullmatch(r"Bash\((.+)\)", r))
+            and not m.group(1).startswith("/")]
+    return (VOICE_RULES + " The only shell commands you may run are: "
+            + "; ".join(cmds) + ". Any other command is refused, so do not "
+            "try variants. Files outside the working directory are off limits.")
+
+
+class HarnessError(RuntimeError):
+    pass
+
+
+def check_workdir(path: str) -> str:
+    """The agent edits only here, so it must be a git repo and not $HOME or /.
+
+    Git makes every edit visible (git diff) and revertible. Returns the
+    resolved path; raises HarnessError with the reason otherwise.
+    """
+    wd = os.path.realpath(os.path.expanduser(path))
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not os.path.isdir(wd):
+        raise HarnessError(f"{wd} is not a directory")
+    if wd == "/" or wd == home or (home + os.sep).startswith(wd + os.sep):
+        raise HarnessError(f"{wd} is too broad - pick one project directory")
+    r = subprocess.run(["git", "-C", wd, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise HarnessError(f"{wd} is not inside a git repository")
+    return wd
+
+
+def allow_rules(workdir: str, extra: list[str]) -> list[str]:
+    """Permission rules for the agent. Anything not listed is refused.
+
+    Measured 2026-09-29: a bare "Read" rule let the model read /etc/hostname
+    and ~/.bashrc, so file access is scoped to the workdir. Git rules are
+    exact-match: "Bash(git diff:*)" would allow `git diff --no-index` on any
+    file, and that was denied only once the prefix form was dropped.
+    """
+    rules = ["Read(./**)", "Edit(./**)",
+             "Bash(git status)", "Bash(git diff)", "Bash(git diff --stat)"]
+    for rule in extra:
+        rules.append(rule)
+        m = re.fullmatch(r"Bash\((.+)\)", rule)
+        if not m:
+            continue
+        cmd = m.group(1)
+        first = cmd.split()[0]
+        # Models call a relative binary by its absolute path (the gate saw
+        # /…/.venv/bin/python for .venv/bin/python), so allow both spellings.
+        if "/" in first and not first.startswith("/"):
+            rel = first[2:] if first.startswith("./") else first
+            rules.append(f"Bash({os.path.join(workdir, rel)}{cmd[len(first):]})")
+    return rules
+
+
+def parse_event(line: str) -> list[dict]:
+    """Normalise one stream-json line into zero or more events.
+
+    kinds: init, text, tool, tool_error, result. Thinking blocks, the flood of
+    system/thinking_tokens lines and anything unknown are dropped.
+    """
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(ev, dict):
+        return []
+    t = ev.get("type")
+    if t == "system" and ev.get("subtype") == "init":
+        return [{"kind": "init", "session_id": ev.get("session_id")}]
+    if t == "assistant":
+        out = []
+        for b in (ev.get("message") or {}).get("content") or []:
+            if b.get("type") == "text" and b.get("text", "").strip():
+                out.append({"kind": "text", "text": b["text"]})
+            elif b.get("type") == "tool_use":
+                out.append({"kind": "tool", "name": b.get("name", "?"),
+                            "input": b.get("input") or {}})
+        return out
+    if t == "user":
+        content = (ev.get("message") or {}).get("content")
+        out = []
+        for b in content if isinstance(content, list) else []:
+            if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("is_error"):
+                out.append({"kind": "tool_error", "text": str(b.get("content"))})
+        return out
+    if t == "result":
+        return [{"kind": "result",
+                 "text": ev.get("result") or "",
+                 "session_id": ev.get("session_id"),
+                 "is_error": bool(ev.get("is_error")) or ev.get("subtype") != "success",
+                 "denials": ev.get("permission_denials") or [],
+                 "turns": ev.get("num_turns"),
+                 "duration_ms": ev.get("duration_ms")}]
+    return []
+
+
+def describe_tool(name: str, inp: dict, workdir: str) -> str:
+    """One short line per tool call: `Read tally/cli.py`, `Bash git status`."""
+    target = inp.get("file_path") or inp.get("path") or inp.get("pattern") or ""
+    if target.startswith(workdir + os.sep):
+        target = target[len(workdir) + 1:]
+    if name == "Bash":
+        target = inp.get("command", "")
+    return f"{name} {target}".strip()
+
+
+def spoken_summary(text: str, max_sentences: int = 3) -> str:
+    """What gets read aloud: markup stripped, capped at a few sentences."""
+    t = for_speech(text)
+    t = re.sub(r"\s*\n+\s*", " ", t).strip()
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    if len(parts) <= max_sentences:
+        return t
+    return " ".join(parts[:max_sentences]) + " The rest is on screen."
+
+
+def is_api_error(text: str) -> bool:
+    # A dead model load comes back as a *successful* result whose text is the
+    # error, e.g. "API Error: 500 ... read error: Input/output error" when the
+    # desktop's disk returned bad bytes. Never read that out as an answer.
+    return text.startswith("API Error")
+
+
+class ClaudeHarness:
+    """One Claude Code process per session, talking stream-json.
+
+    Measured: several turns run in one process, each ending in a `result`
+    event, and a killed process resumes with --resume <session_id> with its
+    history intact.
+    """
+
+    def __init__(self, workdir: str, model: str, llm_url: str,
+                 allow: list[str], binary: str = "claude") -> None:
+        self.workdir = workdir
+        self.model = model
+        self.llm_url = llm_url
+        self.allow = allow
+        self.binary = binary
+        self.session_id: str | None = None
+        self.proc: subprocess.Popen | None = None
+        self._lines = None
+        self._stderr_path = os.path.join(session_dir(), "harness-stderr.log")
+
+    def env(self) -> dict:
+        """A copy of the environment; the user's own Claude setup is untouched."""
+        env = dict(os.environ)
+        env.update({
+            "ANTHROPIC_BASE_URL": self.llm_url,
+            "ANTHROPIC_AUTH_TOKEN": "ollama",
+            "ANTHROPIC_API_KEY": "",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": self.model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": self.model,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": self.model,
+            "CLAUDE_CODE_MAX_CONTEXT_TOKENS": HARNESS_CTX,
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        })
+        return env
+
+    def argv(self) -> list[str]:
+        # --bare: none of the user's hooks, plugins, MCP servers or
+        # auto-memory, and the 64k window stays for the task.
+        a = [self.binary, "-p", "--bare", "--model", self.model,
+             "--input-format", "stream-json", "--output-format", "stream-json",
+             "--verbose", "--permission-mode", "dontAsk",
+             "--allowedTools", *self.allow,
+             "--disallowedTools", "WebFetch", "WebSearch",
+             "--append-system-prompt", agent_prompt(self.allow)]
+        if self.session_id:
+            a += ["--resume", self.session_id]
+        return a
+
+    def start(self) -> None:
+        import queue
+        import threading
+
+        err = open(self._stderr_path, "a")
+        self.proc = subprocess.Popen(
+            self.argv(), cwd=self.workdir, env=self.env(),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+            text=True, bufsize=1,
+        )
+        err.close()
+        q: queue.Queue = queue.Queue()
+
+        def pump(stream, sink):
+            for ln in stream:
+                sink.put(ln)
+            sink.put(None)
+
+        threading.Thread(target=pump, args=(self.proc.stdout, q), daemon=True).start()
+        self._lines = q
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def stop(self) -> None:
+        """Kill the process; the session id is kept so the next turn resumes."""
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
+        self.proc = None
+
+    def reset(self) -> None:
+        self.stop()
+        self.session_id = None
+
+    def stderr_tail(self, n: int = 400) -> str:
+        try:
+            with open(self._stderr_path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()[-n:].strip()
+        except OSError:
+            return ""
+
+    def send(self, text: str, timeout: float = HARNESS_TIMEOUT, on_wait=None):
+        """Send one user turn; yield normalised events up to and incl. result."""
+        import queue
+
+        if not self.alive():
+            self.start()
+        msg = {"type": "user", "message": {"role": "user", "content": text}}
+        try:
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            self.stop()
+            raise HarnessError(f"harness is not running: {exc}; "
+                               f"{self.stderr_tail()}") from exc
+        started = time.time()
+        while True:
+            try:
+                line = self._lines.get(timeout=0.5)
+            except queue.Empty:
+                waited = time.time() - started
+                if waited > timeout:
+                    self.stop()
+                    raise HarnessError(f"no result after {timeout:.0f}s - stopped")
+                if on_wait:
+                    on_wait(waited)
+                continue
+            if line is None:
+                self.stop()
+                raise HarnessError("harness exited mid-turn: "
+                                   + (self.stderr_tail() or "no error output"))
+            for ev in parse_event(line):
+                if ev.get("session_id"):
+                    self.session_id = ev["session_id"]
+                yield ev
+                if ev["kind"] == "result":
+                    return
+
+
+def confirm_transcript(said: str, ask=input) -> str | None:
+    """Voice turns go to the agent only once confirmed.
+
+    whisper large-v3-turbo invents sentences from room noise ("Thank you.",
+    "So, like, this always happens."), and an agent would act on them.
+    Enter sends, x discards, anything else replaces the transcript.
+    """
+    print(f"{DIM}Enter send · x discard · or type a correction{RESET}")
+    try:
+        answer = ask(f"{YELLOW}send?{RESET} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if answer == "":
+        return said
+    if answer.lower() == "x":
+        return None
+    return answer
+
+
+def git_out(workdir: str, *args: str) -> str:
+    r = subprocess.run(["git", "-C", workdir, *args], capture_output=True, text=True)
+    return (r.stdout or r.stderr).rstrip()
+
+
+HARNESS_HELP = f"""{BOLD}Commands (agent mode){RESET}
+  {CYAN}Enter{RESET}          push to talk - Enter to start, Enter to stop, then confirm
+  type a line    send it as text (no confirmation - it is already deliberate)
+  {CYAN}Ctrl+C{RESET}         stop the current turn (the session resumes next turn)
+  {CYAN}/diff{RESET}          show git diff in the working directory
+  {CYAN}/model NAME{RESET}    switch model (restarts the agent, keeps the session)
+  {CYAN}/models{RESET}        list models on the LLM server
+  {CYAN}/speak{RESET}         toggle spoken replies
+  {CYAN}/voice NAME{RESET}    switch voice
+  {CYAN}/voices{RESET}        list voices
+  {CYAN}/reset{RESET}         start a new agent session
+  {CYAN}/help{RESET}          this list
+  {CYAN}/quit{RESET}          exit"""
+
+
+def run_agent_turn(harness: ClaudeHarness, text: str) -> dict:
+    """Drive one turn, printing tool calls as they happen. Returns a summary."""
+    tty = sys.stdout.isatty()
+    tools: list[str] = []
+    texts: list[str] = []
+    errors: list[str] = []
+    result: dict | None = None
+
+    def waiting(secs: float) -> None:
+        if tty:
+            print(f"\r\033[K{DIM}working {secs:.0f}s{RESET}", end="", flush=True)
+
+    def clear() -> None:
+        if tty:
+            print("\r\033[K", end="")
+
+    started = time.time()
+    try:
+        for ev in harness.send(text, on_wait=waiting):
+            if ev["kind"] == "tool":
+                clear()
+                line = describe_tool(ev["name"], ev["input"], harness.workdir)
+                tools.append(line)
+                print(f"{DIM}· {line}{RESET}")
+            elif ev["kind"] == "tool_error":
+                clear()
+                errors.append(ev["text"])
+                why = ("refused" if ev["text"].startswith("Permission to use")
+                       else "failed")
+                detail = " ".join(ev["text"].split())[:100]
+                print(f"{YELLOW}  ↳ {why}: {detail}{RESET}")
+            elif ev["kind"] == "text":
+                texts.append(ev["text"])
+            elif ev["kind"] == "result":
+                result = ev
+    except KeyboardInterrupt:
+        clear()
+        harness.stop()
+        print(f"{YELLOW}turn stopped - the session resumes on the next turn.{RESET}")
+        return {"reply": "", "tools": tools, "stopped": True,
+                "total": time.time() - started}
+    except HarnessError as exc:
+        clear()
+        print(f"{RED}agent error: {exc}{RESET}")
+        return {"reply": "", "tools": tools, "error": str(exc),
+                "total": time.time() - started}
+    clear()
+    reply = (result or {}).get("text") or (texts[-1] if texts else "")
+    return {"reply": reply, "tools": tools, "result": result,
+            "total": time.time() - started}
+
+
+def harness_loop(args, model: str, workdir: str, voice_path: str | None,
+                 speaking: bool, transcript: "Transcript | None") -> int:
+    harness = ClaudeHarness(workdir, model, LLM_URL,
+                            allow_rules(workdir, args.agent_allow or []))
+    # session_dir() makes SIGINT exit the program. Here Ctrl+C has to stop the
+    # current agent turn instead, so give SIGINT back its KeyboardInterrupt;
+    # the temp dir is still removed by atexit and the SIGTERM/SIGHUP handlers.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def meta() -> dict:
+        return {"started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "model": model,
+                "voice": (os.path.basename(voice_path)[:-5]
+                          if speaking and voice_path else None),
+                "server": f"ASR {URL}, agent claude -> {LLM_URL}, workdir {workdir}"}
+
+    print(f"{BOLD}npu-chat agent{RESET} {DIM}- ASR on the NPU; Claude Code driving "
+          f"{model} via {LLM_URL}{RESET}")
+    print(f"{DIM}workdir {workdir} (git) | allowed: "
+          f"{', '.join(harness.allow)}{RESET}")
+    voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
+                  if speaking and voice_path else "voice off")
+    print(f"{DIM}{voice_note} | press Enter to talk, /help for commands{RESET}")
+    if transcript:
+        print(f"{DIM}transcript: {transcript.md}{RESET}")
+    print()
+
+    try:
+        while True:
+            try:
+                line = input(f"{CYAN}{BOLD}you{RESET} ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+
+            if line.startswith("/"):
+                cmd, _, rest = line.partition(" ")
+                cmd, rest = cmd.lower(), rest.strip()
+                if cmd in ("/quit", "/exit", "/q"):
+                    return 0
+                if cmd == "/help":
+                    print(HARNESS_HELP)
+                elif cmd == "/reset":
+                    harness.reset()
+                    print(f"{DIM}new agent session.{RESET}")
+                elif cmd == "/diff":
+                    print(git_out(workdir, "diff") or f"{DIM}no changes.{RESET}")
+                elif cmd == "/models":
+                    names = remote_models(LLM_URL)
+                    print(f"{DIM}on {LLM_URL}: {', '.join(names) or 'none'}{RESET}")
+                elif cmd == "/model":
+                    if not rest:
+                        print(f"{DIM}current model: {model}{RESET}")
+                    else:
+                        model = harness.model = rest
+                        harness.stop()
+                        print(f"{DIM}model set to {model} (session kept).{RESET}")
+                elif cmd == "/speak":
+                    if not tts_ready() or voice_path is None:
+                        print(f"{YELLOW}piper-tts, pw-play or a voice is missing.{RESET}")
+                    else:
+                        speaking = not speaking
+                        print(f"{DIM}spoken replies {'on' if speaking else 'off'}.{RESET}")
+                elif cmd == "/voices":
+                    print(f"{DIM}voices: {', '.join(available_voices()) or 'none found'}{RESET}")
+                elif cmd == "/voice":
+                    found = find_voice(rest) if rest else None
+                    if found is None:
+                        print(f"{YELLOW}voice {rest!r} not found - /voices to list{RESET}")
+                    else:
+                        voice_path, speaking = found, tts_ready()
+                        print(f"{DIM}voice set to {rest}.{RESET}")
+                else:
+                    print(f"{YELLOW}unknown command {cmd} - try /help{RESET}")
+                continue
+
+            audio_secs = None
+            via = "text"
+            if line == "":
+                clip = record_until_enter()
+                if not clip:
+                    continue
+                audio_secs = wav_duration(clip)
+                said = transcribe(clip)
+                if not said:
+                    print(f"{YELLOW}nothing transcribed.{RESET}")
+                    continue
+                print(f"{CYAN}{BOLD}you{RESET} {said}")
+                user_text = confirm_transcript(said)
+                if user_text is None:
+                    print(f"{DIM}discarded.{RESET}")
+                    if transcript:
+                        transcript.turn(meta(), via="voice-discarded", user=said,
+                                        assistant=None, audio_secs=audio_secs,
+                                        sent=False)
+                    continue
+                via = "voice" if user_text == said else "voice-corrected"
+            else:
+                user_text = line
+
+            out = run_agent_turn(harness, user_text)
+            reply = out["reply"]
+            res = out.get("result") or {}
+            if reply and is_api_error(reply):
+                print(f"{RED}{reply}{RESET}")
+                if speaking and voice_path:
+                    speak("The model server returned an error. Details are on screen.",
+                          voice_path)
+                reply_for_log = None
+            elif reply:
+                print(f"{GREEN}{BOLD}agent{RESET} {reply}")
+                secs = res.get("duration_ms")
+                print(f"{DIM}[{model} - {len(out['tools'])} tool calls, "
+                      f"{(secs or out['total'] * 1000) / 1000:.1f}s]{RESET}")
+                if res.get("denials"):
+                    print(f"{YELLOW}{len(res['denials'])} action(s) refused by the "
+                          f"allowlist.{RESET}")
+                if speaking and voice_path:
+                    speak(spoken_summary(reply), voice_path)
+                reply_for_log = reply
+            else:
+                reply_for_log = None
+            if any(t.split()[0] in EDIT_TOOLS for t in out["tools"]):
+                stat = git_out(workdir, "diff", "--stat")
+                if stat:
+                    print(f"{DIM}{stat}{RESET}")
+            if transcript:
+                transcript.turn(meta(), via=via, user=user_text,
+                                assistant=reply_for_log, audio_secs=audio_secs,
+                                model=model, tools=out["tools"],
+                                session_id=harness.session_id,
+                                denials=len(res.get("denials") or []),
+                                total_secs=round(out["total"], 3),
+                                stopped=out.get("stopped", False),
+                                error=out.get("error"))
+            print()
+    finally:
+        harness.stop()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Voice chat with an LLM on the AMD NPU (FastFlowLM).",
         epilog="Push to talk is Enter: press Enter to start recording, Enter again to stop.",
     )
-    ap.add_argument("--model", default=DEFAULT_LLM,
-                    help=f"LLM to chat with (default {DEFAULT_LLM})")
+    ap.add_argument("--model", default=None,
+                    help=f"LLM to chat with (default {DEFAULT_LLM}; "
+                         f"{HARNESS_MODEL} with --harness)")
     ap.add_argument("--no-speak", action="store_true",
                     help="do not speak replies (text only)")
     ap.add_argument("--voice", default=DEFAULT_VOICE,
@@ -517,7 +1030,34 @@ def main() -> int:
                          "else 'this laptop' or 'a separate machine at HOST')")
     ap.add_argument("--no-transcript", action="store_true",
                     help=f"do not write a session transcript under {LOGDIR}")
+    ap.add_argument("--harness", choices=["claude"], default=None,
+                    help="talk to a coding agent instead of a chat model: "
+                         "Claude Code, driving the --llm-url model (ollama)")
+    ap.add_argument("--workdir", default=None,
+                    help="with --harness: the git repo the agent may read and "
+                         "edit (required; not $HOME or /)")
+    ap.add_argument("--agent-allow", action="append", metavar="RULE",
+                    help='with --harness: extra permission rule, e.g. '
+                         '"Bash(.venv/bin/python -m pytest:*)" (repeatable). '
+                         "Allowing a test runner lets the agent run code it edited.")
     args = ap.parse_args()
+
+    workdir = None
+    if args.harness:
+        if not args.workdir:
+            ap.error("--harness needs --workdir (a git repo the agent may edit)")
+        try:
+            workdir = check_workdir(args.workdir)
+        except HarnessError as exc:
+            ap.error(str(exc))
+        if not (args.llm_url or "").strip():
+            ap.error("--harness needs --llm-url / NPU_CHAT_LLM_URL pointing at "
+                     "ollama (the NPU server has no Anthropic endpoint)")
+        if not shutil.which("claude"):
+            print(f"{RED}claude (Claude Code) is not on PATH.{RESET}")
+            return 1
+    elif args.workdir or args.agent_allow:
+        ap.error("--workdir and --agent-allow only apply with --harness")
 
     global LLM_URL
     if args.llm_url:
@@ -534,10 +1074,14 @@ def main() -> int:
             return 1
         llm_server = llm_server_kind(LLM_URL)
         llm_where = args.llm_where or llm_where_default(LLM_URL)
+    model = args.model or (HARNESS_MODEL if args.harness else DEFAULT_LLM)
+    if args.harness and model not in remote_models(LLM_URL):
+        print(f"{RED}model {model} is not on {LLM_URL}.{RESET} "
+              f"{DIM}/models there: {', '.join(remote_models(LLM_URL))}{RESET}")
+        return 1
     if not ensure_server():
         return 1
 
-    model = args.model
     voice_path = find_voice(args.voice)
     speaking = not args.no_speak
     if speaking and not tts_ready():
@@ -564,6 +1108,9 @@ def main() -> int:
         os.makedirs(LOGDIR, exist_ok=True)
         stem = os.path.join(LOGDIR, time.strftime("%Y-%m-%dT%H-%M-%S"))
         transcript = Transcript(stem)
+
+    if args.harness:
+        return harness_loop(args, model, workdir, voice_path, speaking, transcript)
 
     def meta() -> dict:
         return {

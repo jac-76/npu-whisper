@@ -246,6 +246,80 @@ python3 bench_llm.py --no-think --url http://192.168.1.36:11434 \
   --model qwen3.5:9b-16k --model granite4.2:3b-32k
 ```
 
+### Talking to a coding agent (`--harness claude`)
+
+The same push-to-talk loop can drive **Claude Code** instead of a chat model.
+You speak a request, whisper on the NPU transcribes it, a local model on the
+desktop GPU does the work through Claude Code's tools, and piper reads out a
+short summary. Nothing leaves the LAN.
+
+```sh
+export NPU_CHAT_LLM_URL=http://192.168.1.36:11434      # ollama
+npu-chat --harness claude --workdir ~/Dev/some-repo \
+  --agent-allow "Bash(.venv/bin/python -m pytest:*)"
+```
+
+```
+you  Why do the tests fail? Run them, but don't change anything yet.
+· Bash .venv/bin/python -m pytest -v
+· Read tally/stats.py
+agent  range(len(xs) - n) skips the last window; it should be len(xs) - n + 1.
+you  Now fix it and run the tests.
+· Edit tally/stats.py
+· Bash .venv/bin/python -m pytest -v
+agent  Fixed the range in tally/stats.py; all three tests pass.
+ tally/stats.py | 2 +-
+```
+
+The default model is `qwen3.5:4b-64k` (`NPU_CHAT_HARNESS_MODEL`). **It needs a 64k
+context.** At 32k, Claude Code's own prompt plus a few tool results refilled the
+window within three turns and autocompact thrashed in 9 of 16 runs. At 64k it
+thrashed in none of 12. In a small benchmark on a four-file repo it passed 9/9
+tasks (read, fix, extend). That says little about large real repositories.
+
+Claude Code runs as **one long-lived process** speaking stream-json, so turns
+share context. **Ctrl+C** stops the current turn, and the next turn resumes the
+same session (`--resume`), with history intact.
+
+#### What the agent may do
+
+Nothing can be approved by voice mid-turn, so anything not explicitly allowed
+is refused (`--permission-mode dontAsk`). Each rule below exists because a
+looser one was tried and leaked:
+
+- **`--workdir` must be a git repository**, and `$HOME` or `/` is refused. Every
+  edit shows up in `git diff`; the loop prints `git diff --stat` after any turn
+  that edits, and `/diff` shows the full diff.
+- **File access is scoped to the workdir**: `Read(./**)`, `Edit(./**)`. A plain
+  `Read` rule let the model read `/etc/hostname` and `~/.bashrc`. The scoped
+  rules refused both.
+- **Git rules are exact** (`git status`, `git diff`, `git diff --stat`). A
+  `git diff:*` prefix rule would allow `git diff --no-index` on any file.
+- Claude Code also lets some read-only commands (`ls`, `find .`,
+  `git diff <path>`) run inside the workdir without a rule. `ls /etc`, `ls ~`
+  and `git diff … /etc/hostname` were all refused.
+- **`--agent-allow` adds rules**, typically a test runner. Relative commands are
+  also allowed by their absolute path, because models call `.venv/bin/python`
+  as `/full/path/.venv/bin/python`. The agent is told which commands it may run.
+  Before that, it guessed `python -m pytest` and was refused ten times in one
+  turn. **Allowing a test runner allows running code the agent can edit**, so
+  treat it as that.
+- `--bare` keeps your own Claude Code hooks, plugins, MCP servers and memory out
+  of the agent. The env vars pointing Claude Code at ollama are set on the
+  child process only.
+
+#### Every spoken request is confirmed first
+
+whisper invents text from room noise. On the first test of this gate, 3 s of
+silence came back as `*Pewing* *Pewing* *Pewing`. An agent would act on that,
+so a voice transcript is shown with `Enter send · x discard · or type a
+correction`. Discarded transcripts are logged with `"sent": false`. Typed turns
+skip the prompt.
+
+Replies are printed in full, but only the first three sentences, stripped of
+markdown, are spoken. A failed model load (the server answers `API Error: …`)
+is announced as an error and never read out as an answer.
+
 ### Session transcripts
 
 Every session is written to `~/.local/state/npu-chat/<timestamp>.{md,jsonl}` —

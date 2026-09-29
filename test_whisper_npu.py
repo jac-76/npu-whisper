@@ -1,3 +1,5 @@
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -291,3 +293,180 @@ def test_thinking_disabled_only_for_ollama():
     assert m.request_body("qwen3.5:9b", h, "ollama")["reasoning_effort"] == "none"
     assert "reasoning_effort" not in m.request_body("qwen3.5:4b", h, None)
     assert "reasoning_effort" not in m.request_body("granite", h, "llama.cpp")
+
+
+# --- voice -> coding agent (--harness claude) --------------------------------
+
+FIXTURE = "tests/fixtures/claude-stream.jsonl"
+FAKE = os.path.abspath("tests/fake_claude.py")
+
+
+def _chat_in(tmp_path):
+    """Load npu-chat with its session dir in tmp_path (no signal handlers)."""
+    m = _load_chat()
+    m._SESSION_DIR = str(tmp_path)
+    return m
+
+
+def _git_repo(path):
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    return str(path)
+
+
+def test_parse_event_on_captured_claude_stream():
+    """Fixture is real Claude Code 2.1.284 output, three turns in one process."""
+    m = _load_chat()
+    evs = [e for line in open(FIXTURE) for e in m.parse_event(line)]
+    kinds = [e["kind"] for e in evs]
+    assert kinds.count("result") == 3
+    assert kinds.count("init") == 3
+    assert {"kind": "tool", "name": "Read",
+            "input": {"file_path": "/work/repo/tally/config.py"}} in evs
+    results = [e for e in evs if e["kind"] == "result"]
+    assert results[0]["text"] == "7341" and not results[0]["is_error"]
+    assert results[2]["denials"][0]["tool_input"]["command"] == "cat /etc/hostname"
+    assert any(e["kind"] == "tool_error" and e["text"].startswith("Permission to use Bash")
+               for e in evs)
+    # thinking blocks and the thinking_tokens flood are dropped
+    assert all(e["kind"] != "text" or "thinking" not in e for e in evs)
+    assert m.parse_event("not json") == [] and m.parse_event('{"type":"x"}') == []
+
+
+def test_harness_multi_turn_in_one_process(tmp_path):
+    m = _chat_in(tmp_path)
+    log = tmp_path / "argv.jsonl"
+    os.environ["FAKE_CLAUDE_LOG"] = str(log)
+    try:
+        h = m.ClaudeHarness(str(tmp_path), "qwen3.5:4b-64k", "http://h:11434",
+                            m.allow_rules(str(tmp_path), []), binary=FAKE)
+        r1 = [e for e in h.send("first") if e["kind"] == "result"][0]
+        r2 = [e for e in h.send("second") if e["kind"] == "result"][0]
+        assert (r1["text"], r2["text"]) == ("echo: first", "echo: second")
+        assert h.session_id == "sess-1"
+        runs = [json.loads(x) for x in log.read_text().splitlines()]
+        assert len(runs) == 1, "both turns must go to the same process"
+        assert runs[0]["base_url"] == "http://h:11434"
+        assert "--resume" not in runs[0]["argv"]
+    finally:
+        h.stop()
+        del os.environ["FAKE_CLAUDE_LOG"]
+
+
+def test_harness_resumes_after_stop(tmp_path):
+    m = _chat_in(tmp_path)
+    log = tmp_path / "argv.jsonl"
+    os.environ["FAKE_CLAUDE_LOG"] = str(log)
+    try:
+        h = m.ClaudeHarness(str(tmp_path), "m", "http://h:11434", [], binary=FAKE)
+        list(h.send("one"))
+        h.stop()
+        list(h.send("two"))
+        runs = [json.loads(x)["argv"] for x in log.read_text().splitlines()]
+        assert len(runs) == 2
+        assert runs[1][runs[1].index("--resume") + 1] == "sess-1"
+        h.reset()
+        assert h.session_id is None
+    finally:
+        h.stop()
+        del os.environ["FAKE_CLAUDE_LOG"]
+
+
+def test_harness_death_and_timeout_raise(tmp_path):
+    m = _chat_in(tmp_path)
+    h = m.ClaudeHarness(str(tmp_path), "m", "http://h:11434", [], binary=FAKE)
+    try:
+        list(h.send("die"))
+        raise AssertionError("expected HarnessError")
+    except m.HarnessError as exc:
+        assert "model load failed" in str(exc)
+    assert not h.alive()
+    try:
+        list(h.send("hang", timeout=1))
+        raise AssertionError("expected HarnessError")
+    except m.HarnessError as exc:
+        assert "no result after" in str(exc)
+    assert not h.alive()
+
+
+def test_harness_env_is_a_copy(tmp_path):
+    m = _chat_in(tmp_path)
+    before = {k for k in os.environ if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))}
+    h = m.ClaudeHarness(str(tmp_path), "qwen3.5:4b-64k", "http://h:11434", [])
+    env = h.env()
+    assert env["ANTHROPIC_BASE_URL"] == "http://h:11434"
+    assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "qwen3.5:4b-64k"
+    assert env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "65536"
+    after = {k for k in os.environ if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_"))}
+    assert before == after
+    argv = h.argv()
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--bare" in argv
+
+
+def test_workdir_guard(tmp_path):
+    import pytest
+
+    m = _load_chat()
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for bad in (str(plain), os.path.expanduser("~"), "/", str(tmp_path / "nope")):
+        with pytest.raises(m.HarnessError):
+            m.check_workdir(bad)
+    repo = _git_repo(tmp_path / "repo")
+    assert m.check_workdir(repo) == os.path.realpath(repo)
+
+
+def test_allow_rules_are_scoped():
+    """A bare Read rule let the model read /etc/hostname and ~/.bashrc."""
+    m = _load_chat()
+    rules = m.allow_rules("/w", ["Bash(.venv/bin/python -m pytest:*)",
+                                 "Bash(./run-tests.sh)", "Bash(make test)"])
+    assert "Read" not in rules and "Edit" not in rules
+    assert "Read(./**)" in rules and "Edit(./**)" in rules
+    assert "Bash(git diff)" in rules
+    assert not any(r.startswith("Bash(git") and ":*" in r for r in rules)
+    assert "Bash(/w/.venv/bin/python -m pytest:*)" in rules
+    assert "Bash(/w/run-tests.sh)" in rules
+    assert "Bash(/w/make test)" not in rules
+    prompt = m.agent_prompt(rules)
+    assert ".venv/bin/python -m pytest <args>" in prompt
+    assert "/w/" not in prompt
+
+
+def test_confirm_gate():
+    """whisper invents sentences from room noise; the agent must not act on them."""
+    m = _load_chat()
+    assert m.confirm_transcript("fix it", ask=lambda _: "") == "fix it"
+    assert m.confirm_transcript("Thank you.", ask=lambda _: "x") is None
+    assert m.confirm_transcript("fix the NPU", ask=lambda _: "fix the NPU bug") == "fix the NPU bug"
+
+    def eof(_):
+        raise EOFError
+    assert m.confirm_transcript("anything", ask=eof) is None
+
+
+def test_spoken_summary_and_api_error():
+    m = _load_chat()
+    s = m.spoken_summary("Fixed **it**. Tests pass. One. Two. Three.")
+    assert s == "Fixed it. Tests pass. One. The rest is on screen."
+    assert m.spoken_summary("Done.") == "Done."
+    assert m.is_api_error("API Error: 500 llama-server process has terminated")
+    assert not m.is_api_error("The API returns 500 on bad input.")
+
+
+def test_describe_tool_is_workdir_relative():
+    m = _load_chat()
+    assert m.describe_tool("Read", {"file_path": "/w/tally/cli.py"}, "/w") == "Read tally/cli.py"
+    assert m.describe_tool("Bash", {"command": "git status"}, "/w") == "Bash git status"
+
+
+def test_harness_cli_refuses_bad_setups(tmp_path):
+    def run(*a):
+        return subprocess.run([sys.executable, "npu-chat", *a], capture_output=True,
+                              text=True, stdin=subprocess.DEVNULL, timeout=30)
+    r = run("--harness", "claude")
+    assert r.returncode == 2 and "--workdir" in r.stderr
+    r = run("--workdir", str(tmp_path))
+    assert r.returncode == 2 and "only apply with --harness" in r.stderr
+    r = run("--harness", "claude", "--workdir", str(tmp_path))
+    assert r.returncode == 2 and "not inside a git repository" in r.stderr
