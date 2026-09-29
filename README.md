@@ -149,9 +149,13 @@ transcript keep the model's raw output.
 
 FastFlowLM only runs models it ships an NPU2 build for — 38 of them, and
 **Granite is not among them** (`flm pull granite4.2:3b` → "Model not found").
-More importantly for agent work, **FastFlowLM has no tool calling**: pass
-`tools` and it is silently ignored, and a small model will then *pretend* to
-call the tool and fabricate the result.
+For agent work, **tool calling on FastFlowLM depends on the model.** Given the
+same `tools` array on FLM 1.0.4, `qwen3.5:4b` returns a real call
+(`finish_reason: tool_calls`, `get_weather({"city": "Columbus, Ohio"})`), while
+`gemma3:1b` ignores it (`finish_reason: stop`) and has been seen to *pretend*
+it called the tool and fabricate the result. An earlier version of this README
+said FastFlowLM has no tool calling at all, which was wrong: only `gemma3:1b` had
+been tested.
 
 So the LLM endpoint is separable. ASR stays on the NPU; point `--llm-url` at any
 OpenAI-compatible server:
@@ -178,8 +182,69 @@ Measured on this box, same prompt, warm:
 | `granite-4.2-3b` Q4_K_M | CPU + RTX 4070 | **0.22 s** | **94.3** | **yes** (`finish_reason=tool_calls`) |
 
 The system prompt tracks this honestly — with `--llm-url` set, the assistant is
-told it runs on the CPU and GPU rather than the NPU, so asking it where it runs
+told it is *not* on the NPU, and where it is (see `--llm-where` below), so asking it where it runs
 still gets a true answer.
+
+### A bigger LLM on another machine's GPU (ollama)
+
+Speech stays on the laptop (NPU whisper, piper voice, the laptop's mic and
+speakers); only generation goes over the network to a desktop with an **RTX
+3060 Ti (8 GB)** running ollama:
+
+```sh
+export NPU_CHAT_LLM_URL=http://192.168.1.36:11434
+export NPU_CHAT_LLM_WHERE="the downstairs desktop's NVIDIA RTX 3060 Ti"
+export NPU_CHAT_MODEL=qwen3.5:9b-16k
+npu-chat
+```
+
+`--llm-where` is what the model is told about where it runs. Without it a
+remote server is described as "a separate machine at HOST", because nothing on
+the wire says what hardware is behind it. If the server is unreachable,
+npu-chat says so at startup and exits. It does **not** fall back to the NPU,
+since a reply from a model you did not pick would be a surprise.
+
+**Context is the constraint on 8 GB, not weights.** A model's context is set
+per model in ollama (`FROM qwen3.5:9b` + `PARAMETER num_ctx 16384` in a
+Modelfile, then `ollama create qwen3.5:9b-16k`). Clients cannot pass it through
+`/v1`. Measured placement (`ollama ps`):
+
+| model | context | size | placement |
+|---|---|---|---|
+| `qwen3.5:9b` | 16k | 5.9 GB | 100% GPU |
+| `qwen3.5:9b` | 32k | 7.2 GB | 18% CPU / 82% GPU |
+| `qwen3.5:4b` | 64k | 5.3 GB | 100% GPU |
+| `qwen3:8b` | 8k | 6.2 GB | 100% GPU |
+| `qwen3:8b` | 16k | 7.8 GB | 15% CPU / 85% GPU |
+| `granite4.2:3b` | 32k | 5.0 GB | 100% GPU |
+| `llama3.1:8b` | 32k | 9.5 GB | 32% CPU / 68% GPU |
+
+**Thinking must be off.** Qwen3.5 on ollama reasons by default and spent the
+whole 512-token budget on it: empty reply, `finish_reason: length`, on every
+prompt. npu-chat sends `reasoning_effort: "none"` to ollama servers, which
+brought reasoning to zero characters. `"think": false` and
+`chat_template_kwargs` are silently ignored on ollama's `/v1` endpoint.
+
+Measured from the laptop over WiFi with `bench_llm.py --no-think`, warm, 3 runs
+per prompt, word problem ×5:
+
+| model | where | factual | first token | tok/s | word problem | tool call |
+|---|---|---|---|---|---|---|
+| `qwen3.5:4b` | laptop NPU (FLM) | 3.24 s | 1.11 s | 15.5 | 5/5 | yes |
+| **`qwen3.5:9b-16k`** | desktop 3060 Ti | 0.80 s | 0.07 s | 60.5 | **5/5** | yes |
+| `qwen3.5:4b-32k` | desktop 3060 Ti | 0.57 s | 0.06 s | 87.5 | 4/5 | yes |
+| `qwen3:8b-8k` | desktop 3060 Ti | 0.42 s | 0.04 s | 76.6 | 5/5 | yes |
+| `granite4.2:3b-32k` | desktop 3060 Ti | 0.23 s | 0.04 s | 126.2 | 5/5 | yes |
+
+`qwen3.5:9b-16k` is the pick for talking: 5/5, and the one whose Ohio answer
+held up (`qwen3.5:4b` claimed Columbus hosts "America's first National Mall").
+Only one model fits in 8 GB at a time, so switching models costs a cold load
+(~5 s for the first reply).
+
+```sh
+python3 bench_llm.py --no-think --url http://192.168.1.36:11434 \
+  --model qwen3.5:9b-16k --model granite4.2:3b-32k
+```
 
 ### Session transcripts
 

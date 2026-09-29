@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 
@@ -61,7 +62,30 @@ SYSTEM_PROMPT = (
 )
 
 
-def self_facts(model: str, voice: str | None, llm_on_npu: bool = True) -> str:
+def llm_where_default(llm_url: str) -> str:
+    """Where a non-NPU LLM runs, without claiming hardware we cannot see."""
+    host = urllib.parse.urlsplit(llm_url).hostname or llm_url
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return "this laptop"
+    return f"a separate machine at {host}"
+
+
+def llm_server_kind(llm_url: str) -> str | None:
+    """Name the server behind an OpenAI-compatible URL, if it says."""
+    probes = (("/api/version", "ollama", "version"),
+              ("/props", "llama.cpp", "default_generation_settings"))
+    for path, name, key in probes:
+        try:
+            d = json.loads(urllib.request.urlopen(llm_url + path, timeout=3).read())
+        except Exception:
+            continue
+        if isinstance(d, dict) and key in d:
+            return name
+    return None
+
+
+def self_facts(model: str, voice: str | None, llm_on_npu: bool = True,
+               server: str | None = None, where: str | None = None) -> str:
     """Tell the model what it actually is.
 
     Small models cannot know their own identity or where they run, and asking
@@ -76,10 +100,11 @@ def self_facts(model: str, voice: str | None, llm_on_npu: bool = True) -> str:
         ]
     else:
         bits = [
-            f"you are the model {model}, served by llama.cpp on this laptop's "
-            "CPU and RTX 4070 Laptop GPU, not on the NPU",
-            "speech recognition is whisper-large-v3-turbo running on the AMD "
-            "Ryzen AI 9 365 (XDNA2) NPU",
+            f"you are the model {model}, served by "
+            f"{server or 'an OpenAI-compatible server'} on "
+            f"{where or 'another machine'}, not on the NPU",
+            "speech recognition is whisper-large-v3-turbo running on this "
+            "laptop's AMD Ryzen AI 9 365 (XDNA2) NPU",
         ]
     if voice:
         bits.append(f"your voice is piper {voice}, which runs on the CPU")
@@ -295,11 +320,21 @@ def transcribe(path: str) -> str:
     return (d.get("text") or "").strip()
 
 
-def stream_reply(model: str, history: list[dict]) -> tuple[str, float | None, float]:  # noqa: E501
-    """Stream a chat completion from the NPU, printing tokens as they arrive."""
-    body = json.dumps(
-        {"model": model, "messages": history, "max_tokens": 512, "stream": True}
-    ).encode()
+def request_body(model: str, history: list[dict], server: str | None) -> dict:
+    body = {"model": model, "messages": history, "max_tokens": 512, "stream": True}
+    if server == "ollama":
+        # Qwen3.5 on ollama thinks by default and spent the whole 512-token
+        # budget on it: empty content, finish_reason=length, 5/5 word problems
+        # "unanswered". Measured: reasoning_effort="none" gives 0 reasoning
+        # chars; think:false and chat_template_kwargs are ignored on /v1.
+        body["reasoning_effort"] = "none"
+    return body
+
+
+def stream_reply(model: str, history: list[dict],
+                 server: str | None = None) -> tuple[str, float | None, float]:
+    """Stream a chat completion, printing tokens as they arrive."""
+    body = json.dumps(request_body(model, history, server)).encode()
     req = urllib.request.Request(
         f"{LLM_URL}/v1/chat/completions",
         data=body,
@@ -332,6 +367,9 @@ def stream_reply(model: str, history: list[dict]) -> tuple[str, float | None, fl
                 sys.stdout.flush()
     except Exception as exc:
         print(f"\n{RED}generation failed: {exc}{RESET}")
+        if LLM_URL != URL:
+            print(f"{DIM}LLM is {LLM_URL}; drop --llm-url / NPU_CHAT_LLM_URL "
+                  f"to use the NPU.{RESET}")
         return "", None, time.time() - start
     reply = "".join(out).strip()
     total = time.time() - start
@@ -433,7 +471,18 @@ HELP = f"""{BOLD}Commands{RESET}
   {CYAN}/quit{RESET}          exit"""
 
 
+def remote_models(llm_url: str) -> list[str]:
+    """Model ids an OpenAI-compatible server offers, via /v1/models."""
+    try:
+        d = json.loads(urllib.request.urlopen(f"{llm_url}/v1/models", timeout=5).read())
+    except Exception:
+        return []
+    return sorted(m["id"] for m in d.get("data", []) if isinstance(m, dict) and "id" in m)
+
+
 def installed_models() -> list[str]:
+    if LLM_URL != URL:
+        return remote_models(LLM_URL)
     if not shutil.which("flm"):
         return []
     out = subprocess.run(["flm", "list"], capture_output=True, text=True)
@@ -457,10 +506,15 @@ def main() -> int:
     ap.add_argument("--voice", default=DEFAULT_VOICE,
                     help=f"piper voice id or .onnx path (default {DEFAULT_VOICE})")
     ap.add_argument("--system", default=SYSTEM_PROMPT, help="override the system prompt")
-    ap.add_argument("--llm-url", default=None,
+    ap.add_argument("--llm-url", default=os.environ.get("NPU_CHAT_LLM_URL") or None,
                     help="OpenAI-compatible base URL for the LLM "
-                         "(default: the NPU server; e.g. http://127.0.0.1:8080 "
-                         "for llama-server)")
+                         "(default: $NPU_CHAT_LLM_URL, else the NPU server; e.g. "
+                         "http://127.0.0.1:8080 for llama-server, "
+                         "http://HOST:11434 for ollama)")
+    ap.add_argument("--llm-where", default=os.environ.get("NPU_CHAT_LLM_WHERE") or None,
+                    help="where the --llm-url model runs, told to the model so it "
+                         "can answer truthfully (default: $NPU_CHAT_LLM_WHERE, "
+                         "else 'this laptop' or 'a separate machine at HOST')")
     ap.add_argument("--no-transcript", action="store_true",
                     help=f"do not write a session transcript under {LOGDIR}")
     args = ap.parse_args()
@@ -468,6 +522,18 @@ def main() -> int:
     global LLM_URL
     if args.llm_url:
         LLM_URL = args.llm_url.rstrip("/")
+    llm_server = llm_where = None
+    if LLM_URL != URL:
+        # Fail now, before starting the NPU server or recording anything. No
+        # fallback to the NPU model: a reply from a model other than the one
+        # asked for would be a surprise.
+        if not remote_models(LLM_URL):
+            print(f"{RED}LLM server {LLM_URL} is unreachable or lists no models.{RESET}")
+            print(f"{DIM}Check it is up, or drop --llm-url / NPU_CHAT_LLM_URL "
+                  f"to use the NPU.{RESET}")
+            return 1
+        llm_server = llm_server_kind(LLM_URL)
+        llm_where = args.llm_where or llm_where_default(LLM_URL)
     if not ensure_server():
         return 1
 
@@ -488,7 +554,8 @@ def main() -> int:
                     if speaking and voice_path else None)
         return {"role": "system",
                 "content": args.system + self_facts(model, voice_id,
-                                                    LLM_URL == URL)}
+                                                    LLM_URL == URL,
+                                                    llm_server, llm_where)}
 
     history = [system_msg()]
 
@@ -504,7 +571,7 @@ def main() -> int:
             "model": model,
             "voice": (os.path.basename(voice_path)[:-5]
                       if speaking and voice_path else None),
-            "server": URL,
+            "server": URL if LLM_URL == URL else f"ASR {URL}, LLM {LLM_URL}",
         }
 
     if LLM_URL == URL:
@@ -512,7 +579,8 @@ def main() -> int:
               f"via {URL}{RESET}")
     else:
         print(f"{BOLD}npu-chat{RESET} {DIM}- ASR on the NPU via {URL}; "
-              f"LLM via {LLM_URL}{RESET}")
+              f"LLM via {LLM_URL} ({llm_server or 'unknown server'}, "
+              f"{llm_where}){RESET}")
     voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
                   if speaking and voice_path else "voice off")
     print(f"{DIM}model {model} | {voice_note} | press Enter to talk, "
@@ -596,7 +664,7 @@ def main() -> int:
             user_text = line
 
         history.append({"role": "user", "content": user_text})
-        reply, ttft, total = stream_reply(model, history)
+        reply, ttft, total = stream_reply(model, history, llm_server)
         if reply:
             history.append({"role": "assistant", "content": reply})
             if speaking and voice_path:

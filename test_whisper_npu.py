@@ -199,3 +199,95 @@ def test_for_speech_keeps_underscores_in_identifiers():
 def test_default_model_is_the_benchmarked_one():
     m = _load_chat()
     assert m.DEFAULT_LLM == "qwen3.5:4b"
+
+
+def test_self_facts_remote_llm_claims_no_hardware_it_cannot_see():
+    """A remote LLM used to be described as llama.cpp on the laptop's RTX 4070."""
+    m = _load_chat()
+    s = m.self_facts("qwen3.5:9b", None, False, "ollama",
+                     m.llm_where_default("http://192.168.1.36:11434"))
+    assert "served by ollama on a separate machine at 192.168.1.36" in s
+    assert "not on the NPU" in s
+    assert "4070" not in s
+    assert m.llm_where_default("http://127.0.0.1:8080") == "this laptop"
+    told = m.self_facts("x", None, False, None, "the desktop's RTX 3060 Ti")
+    assert "the desktop's RTX 3060 Ti" in told
+
+
+def _stub_server(routes: dict):
+    """Serve fixed JSON bodies on 127.0.0.1; returns (base_url, server)."""
+    import http.server
+    import json
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = routes.get(self.path)
+            if body is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", srv
+
+
+def test_models_listed_from_remote_llm_server():
+    m = _load_chat()
+    base, srv = _stub_server({
+        "/v1/models": {"data": [{"id": "qwen3:8b"}, {"id": "granite4.2:3b"}]},
+        "/api/version": {"version": "0.33.3"},
+    })
+    try:
+        m.LLM_URL = base
+        assert m.installed_models() == ["granite4.2:3b", "qwen3:8b"]
+        assert m.llm_server_kind(base) == "ollama"
+    finally:
+        srv.shutdown()
+
+
+def test_llama_server_detected_and_dead_server_is_none():
+    m = _load_chat()
+    base, srv = _stub_server({"/props": {"default_generation_settings": {}}})
+    try:
+        assert m.llm_server_kind(base) == "llama.cpp"
+    finally:
+        srv.shutdown()
+    assert m.remote_models("http://127.0.0.1:9") == []
+
+
+def test_llm_url_defaults_from_env_and_dead_server_fails_fast():
+    import os
+
+    env = dict(os.environ, NPU_CHAT_LLM_URL="http://127.0.0.1:9")
+    out = subprocess.run(
+        [sys.executable, "npu-chat", "--no-speak", "--no-transcript"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+        timeout=30,
+    )
+    assert out.returncode == 1
+    assert "http://127.0.0.1:9 is unreachable" in out.stdout
+    assert "NPU_CHAT_LLM_URL" in out.stdout
+
+
+def test_bench_llm_compiles():
+    subprocess.run([sys.executable, "-m", "py_compile", "bench_llm.py"], check=True)
+
+
+def test_thinking_disabled_only_for_ollama():
+    """Qwen3.5 on ollama spent all 512 tokens thinking and returned nothing."""
+    m = _load_chat()
+    h = [{"role": "user", "content": "hi"}]
+    assert m.request_body("qwen3.5:9b", h, "ollama")["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in m.request_body("qwen3.5:4b", h, None)
+    assert "reasoning_effort" not in m.request_body("granite", h, "llama.cpp")
