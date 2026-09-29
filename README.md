@@ -259,17 +259,26 @@ npu-chat --harness claude --workdir ~/Dev/some-repo \
   --agent-allow "Bash(.venv/bin/python -m pytest:*)"
 ```
 
+A real session (typed turns, some tool lines omitted, first reply cut):
+
 ```
-you  Why do the tests fail? Run them, but don't change anything yet.
-· Bash .venv/bin/python -m pytest -v
+you Why do the tests fail? Run them to find out, but do not change anything yet.
+· Bash .venv/bin/python -m pytest -v 2>&1
+  ↳ failed: Exit code 1 ...
 · Read tally/stats.py
-agent  range(len(xs) - n) skips the last window; it should be len(xs) - n + 1.
-you  Now fix it and run the tests.
+agent I found the bug. In `tally/stats.py` line 11, the formula for generating windows is incorrect: …
+[qwen3.5:4b-64k - 7 tool calls, 19.2s]
+
+you Now fix the bug in tally/ and run the tests to confirm. Do not change tests/.
 · Edit tally/stats.py
 · Bash .venv/bin/python -m pytest -v
-agent  Fixed the range in tally/stats.py; all three tests pass.
+agent I fixed the bug in `tally/stats.py` by changing `range(len(xs) - n)` to `range(len(xs) - n + 1)`. The original code excluded the last valid window from generating averages. All three tests now pass.
+[qwen3.5:4b-64k - 2 tool calls, 6.0s]
  tally/stats.py | 2 +-
 ```
+
+It does not always follow instructions. In an earlier run it made the fix during
+the "don't change anything yet" turn.
 
 The default model is `qwen3.5:4b-64k` (`NPU_CHAT_HARNESS_MODEL`). **It needs a 64k
 context.** At 32k, Claude Code's own prompt plus a few tool results refilled the
