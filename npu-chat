@@ -84,6 +84,29 @@ def llm_where_default(llm_url: str) -> str:
     return f"a separate machine at {host}"
 
 
+def prewarm(llm_url: str, model: str, server: str | None) -> None:
+    """Ask ollama to load the model now, in the background.
+
+    A cold model costs ~5 s on the first reply; loading it while the user is
+    still reading the banner hides that. An /api/generate request with no
+    prompt loads the model without generating anything. ollama only.
+    """
+    if server != "ollama":
+        return
+    import threading
+
+    def go():
+        try:
+            req = urllib.request.Request(
+                f"{llm_url}/api/generate",
+                data=json.dumps({"model": model}).encode(),
+                headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=120).read()
+        except Exception:
+            pass    # the first real turn will surface any problem
+    threading.Thread(target=go, daemon=True).start()
+
+
 def llm_server_kind(llm_url: str) -> str | None:
     """Name the server behind an OpenAI-compatible URL, if it says."""
     probes = (("/api/version", "ollama", "version"),
@@ -1189,6 +1212,7 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
                     else:
                         model = harness.model = rest
                         harness.stop()
+                        prewarm(LLM_URL, model, llm_server_kind(LLM_URL))
                         print(f"{DIM}model set to {model} (session kept).{RESET}")
                 elif cmd == "/speak":
                     if not tts_ready() or voice_path is None:
@@ -1361,6 +1385,8 @@ def main() -> int:
         print(f"{RED}model {model} is not on {LLM_URL}.{RESET} "
               f"{DIM}/models there: {', '.join(remote_models(LLM_URL))}{RESET}")
         return 1
+    if LLM_URL != URL:
+        prewarm(LLM_URL, model, llm_server)
     if not ensure_server():
         return 1
 
@@ -1451,8 +1477,10 @@ def main() -> int:
                 else:
                     model = rest
                     history[0] = system_msg()
+                    if LLM_URL != URL:
+                        prewarm(LLM_URL, model, llm_server)
                     print(f"{DIM}model set to {model} "
-                          f"(loads on first use){RESET}")
+                          f"(loading now){RESET}")
             elif cmd == "/speak":
                 if not tts_ready():
                     print(f"{YELLOW}piper-tts or pw-play is missing.{RESET}")

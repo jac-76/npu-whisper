@@ -600,3 +600,39 @@ def test_vad_threshold_sits_between_measured_noise_and_quiet_speech():
     """Measured on this mic: noise peaked <= 0.074, quiet speech >= 0.163."""
     m = _load_chat()
     assert 0.074 < m.VAD_MIN < 0.163
+
+
+def test_prewarm_loads_on_ollama_only(tmp_path):
+    """A cold model cost ~5 s on the first reply; prewarm loads it at startup."""
+    import http.server
+    import threading
+    import time as t
+
+    hits = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            hits.append((self.path, json.loads(body)))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        m = _load_chat()
+        m.prewarm(base, "qwen3.5:9b-16k", "llama.cpp")
+        m.prewarm(base, "qwen3.5:9b-16k", None)
+        m.prewarm(base, "qwen3.5:9b-16k", "ollama")
+        deadline = t.time() + 5
+        while not hits and t.time() < deadline:
+            t.sleep(0.02)
+        t.sleep(0.2)
+        assert hits == [("/api/generate", {"model": "qwen3.5:9b-16k"})]
+    finally:
+        srv.shutdown()

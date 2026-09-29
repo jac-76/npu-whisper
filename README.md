@@ -238,8 +238,11 @@ per prompt, word problem ×5:
 
 `qwen3.5:9b-16k` is the pick for talking: 5/5, and the one whose Ohio answer
 held up (`qwen3.5:4b` claimed Columbus hosts "America's first National Mall").
-Only one model fits in 8 GB at a time, so switching models costs a cold load
-(~5 s for the first reply).
+Only one model fits in 8 GB at a time, so switching models costs a cold load.
+npu-chat hides it by asking ollama to load the model in the background at
+startup (and on `/model`). From an unloaded model, the first turn sent 6 s after
+startup got its first token in 0.14 s. Without the pre-load the same cold turn
+took 3.3 s.
 
 ```sh
 python3 bench_llm.py --no-think --url http://192.168.1.36:11434 \
