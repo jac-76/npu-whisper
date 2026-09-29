@@ -470,3 +470,84 @@ def test_harness_cli_refuses_bad_setups(tmp_path):
     assert r.returncode == 2 and "only apply with --harness" in r.stderr
     r = run("--harness", "claude", "--workdir", str(tmp_path))
     assert r.returncode == 2 and "not inside a git repository" in r.stderr
+
+
+# --- streamed speech and barge-in ---------------------------------------------
+
+def test_sentence_splitter_boundaries():
+    m = _load_chat()
+    sp = m.SentenceSplitter()
+    assert sp.feed("Hello there. How") == ["Hello there. "]
+    assert sp.feed(" are you?") == []           # no whitespace after ? yet
+    assert sp.flush() == ["How are you?"]
+    sp = m.SentenceSplitter()
+    assert sp.feed("Pi is 3.14 roughly and e.g") == []   # no split inside numbers
+    assert sp.feed(" more.\nNext line") == ["Pi is 3.14 roughly and e.g more.\n"]
+    assert sp.flush() == ["Next line"]
+
+
+def test_sentence_splitter_drops_fenced_code():
+    m = _load_chat()
+    sp = m.SentenceSplitter()
+    out = sp.feed("Run this:\n```py\nprint(1)\n") + sp.feed("```\nDone. ")
+    assert out == ["Run this:\n", "Done. "]
+    sp = m.SentenceSplitter()
+    assert sp.feed("Code: ```x = 1") == ["Code: "]
+    assert sp.flush() == []                      # unterminated fence is never spoken
+
+
+def _speaker(m, tmp_path, delay):
+    """Speaker with a fake synth (writes the text) and a fake player that
+    logs what it 'plays' and sleeps for `delay` seconds."""
+    log = tmp_path / "played.txt"
+
+    def factory(_voice):
+        def synth(text, wav):
+            open(wav, "w").write(text)
+            return True
+        return synth
+
+    player = [sys.executable, "-c",
+              "import sys,time; open(sys.argv[1],'a').write(open(sys.argv[2]).read()+'\\n');"
+              f" time.sleep({delay})", str(log)]
+    return m.Speaker("voice.onnx", synth_factory=factory, player=player), log
+
+
+def test_speaker_plays_in_order_and_times_first_audio(tmp_path):
+    m = _chat_in(tmp_path)
+    sp, log = _speaker(m, tmp_path, 0.05)
+    sp.begin()
+    for piece in ["One is **bold**. ", "Two. ", "Three"]:
+        sp.feed(piece)
+    sp.finish()
+    sp.wait_idle(10)
+    assert log.read_text().split("\n")[:3] == ["One is bold.", "Two.", "Three"]
+    assert sp.first_audio is not None and sp.first_audio < 5
+
+
+def test_speaker_stop_silences_and_drops_the_queue(tmp_path):
+    """Barge-in: Enter while it talks must cut it off, not finish the reply."""
+    import time as t
+
+    m = _chat_in(tmp_path)
+    sp, log = _speaker(m, tmp_path, 3.0)
+    sp.say("First sentence. Second sentence. Third sentence. Fourth.")
+    assert sp.wait_first_audio(5) is not None
+    deadline = t.time() + 5
+    while not log.exists() and t.time() < deadline:   # wait until it is audibly playing
+        t.sleep(0.02)
+    t0 = t.time()
+    sp.stop()
+    sp.wait_idle(10)
+    assert t.time() - t0 < 2.0, "stop() must not wait for playback to finish"
+    t.sleep(0.3)
+    assert log.read_text().count("\n") == 1, "queued sentences must be dropped"
+    sp.say("After barge-in.")
+    sp.wait_idle(10)
+    assert log.read_text().strip().split("\n")[-1] == "After barge-in."
+
+
+def test_confirm_flag_exists_for_chat_mode():
+    out = subprocess.run([sys.executable, "npu-chat", "--help"],
+                         capture_output=True, text=True, check=True)
+    assert "--confirm" in out.stdout

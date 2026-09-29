@@ -331,9 +331,13 @@ def request_body(model: str, history: list[dict], server: str | None) -> dict:
     return body
 
 
-def stream_reply(model: str, history: list[dict],
-                 server: str | None = None) -> tuple[str, float | None, float]:
-    """Stream a chat completion, printing tokens as they arrive."""
+def stream_reply(model: str, history: list[dict], server: str | None = None,
+                 on_delta=None) -> tuple[str, float | None, float]:
+    """Stream a chat completion, printing tokens as they arrive.
+
+    on_delta gets each piece of text too, so speech can start on the first
+    sentence instead of waiting for the whole reply.
+    """
     body = json.dumps(request_body(model, history, server)).encode()
     req = urllib.request.Request(
         f"{LLM_URL}/v1/chat/completions",
@@ -365,6 +369,8 @@ def stream_reply(model: str, history: list[dict],
                 out.append(delta)
                 sys.stdout.write(delta)
                 sys.stdout.flush()
+                if on_delta:
+                    on_delta(delta)
     except Exception as exc:
         print(f"\n{RED}generation failed: {exc}{RESET}")
         if LLM_URL != URL:
@@ -430,32 +436,211 @@ def for_speech(text: str) -> str:
     return t.strip()
 
 
-def speak(text: str, voice_path: str) -> None:
-    """Synthesise with piper-tts and play through the default sink.
+class SentenceSplitter:
+    """Cut streamed text into speakable pieces as soon as each one is complete.
 
-    Do NOT pass --output-raw: it redirects audio to stdout and leaves -f empty,
-    so playback gets silence. This bit us before.
+    A piece ends at . ! or ? followed by whitespace, or at a newline, so
+    "3.5" and "e.g" mid-word never split. Fenced code is dropped whole:
+    piper reading a code block aloud is never what anyone wants.
     """
-    text = for_speech(text)
-    if not text:
-        return
-    wav = os.path.join(session_dir(), "reply.wav")
+
+    _END = re.compile(r"[.!?][\"')\]]*\s+|\n+")
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_fence = False
+
+    def feed(self, delta: str) -> list[str]:
+        self._buf += delta
+        out: list[str] = []
+        while True:
+            if self._in_fence:
+                close = self._buf.find("```")
+                if close < 0:
+                    return out
+                self._buf = self._buf[close + 3:]
+                self._in_fence = False
+                continue
+            fence = self._buf.find("```")
+            m = self._END.search(self._buf)
+            if fence >= 0 and (m is None or fence < m.start()):
+                if self._buf[:fence].strip():
+                    out.append(self._buf[:fence])
+                self._buf = self._buf[fence + 3:]
+                self._in_fence = True
+                continue
+            if m is None:
+                return out
+            if self._buf[:m.end()].strip():
+                out.append(self._buf[:m.end()])
+            self._buf = self._buf[m.end():]
+
+    def flush(self) -> list[str]:
+        rest, self._buf = ("" if self._in_fence else self._buf), ""
+        self._in_fence = False
+        return [rest] if rest.strip() else []
+
+
+def _piper_synth_factory(voice_path: str):
+    """Load the voice once, in-process: 0.06 s per sentence instead of the
+    0.75 s a piper-tts process spends reloading the model on every call.
+    Falls back to the piper-tts CLI if the module is not importable."""
     try:
-        subprocess.run(
-            ["piper-tts", "-m", voice_path, "-f", wav],
-            input=text.encode(),
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
-        print(f"{YELLOW}piper-tts failed: {detail[:200]}{RESET}")
-        return
-    except FileNotFoundError:
-        print(f"{YELLOW}piper-tts not found.{RESET}")
-        return
-    subprocess.run(["pw-play", wav], stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL)
+        from piper import PiperVoice
+        voice = PiperVoice.load(voice_path)
+    except Exception:
+        def cli(text: str, wav: str) -> bool:
+            # Never --output-raw: it leaves -f empty and playback is silence.
+            r = subprocess.run(["piper-tts", "-m", voice_path, "-f", wav],
+                               input=text.encode(), capture_output=True)
+            return r.returncode == 0
+        return cli
+
+    def inproc(text: str, wav: str) -> bool:
+        with wave.open(wav, "wb") as w:
+            voice.synthesize_wav(text, w)
+        return True
+    return inproc
+
+
+class Speaker:
+    """Speak a reply while it is still streaming, and stop the moment asked.
+
+    Complete sentences go to a synthesis thread, finished WAVs to a playback
+    thread, so sentence two is synthesised while sentence one plays. stop()
+    kills playback and drops everything queued (barge-in): anything tagged
+    with an older generation is discarded rather than spoken late.
+    """
+
+    def __init__(self, voice_path: str, synth_factory=_piper_synth_factory,
+                 player: list[str] | None = None) -> None:
+        import queue
+        import threading
+
+        self.voice_path = voice_path
+        self._factory = synth_factory
+        self._synth = None
+        self._synth_ready = threading.Event()
+        self._player = player or ["pw-play"]
+        self._text_q: queue.Queue = queue.Queue()
+        self._wav_q: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._gen = 0
+        self._n = 0
+        self._busy = 0
+        self._play: subprocess.Popen | None = None
+        self._splitter = SentenceSplitter()
+        self.first_audio: float | None = None
+        self._started_at: float | None = None
+        self._first_event = threading.Event()
+        threading.Thread(target=self._load, daemon=True).start()
+        threading.Thread(target=self._synth_loop, daemon=True).start()
+        threading.Thread(target=self._play_loop, daemon=True).start()
+
+    def _load(self) -> None:
+        self._synth = self._factory(self.voice_path)
+        self._synth_ready.set()
+
+    def set_voice(self, voice_path: str) -> None:
+        self.stop()
+        self.voice_path = voice_path
+        self._synth_ready.clear()
+        self._load()
+
+    def begin(self) -> None:
+        """Start of a reply: timing for first_audio is measured from here."""
+        self._splitter = SentenceSplitter()
+        self.first_audio = None
+        self._first_event.clear()
+        self._started_at = time.time()
+
+    def _put(self, piece: str) -> None:
+        text = for_speech(piece)
+        if text:
+            with self._lock:
+                self._busy += 1
+                self._text_q.put((self._gen, text))
+
+    def feed(self, delta: str) -> None:
+        for piece in self._splitter.feed(delta):
+            self._put(piece)
+
+    def finish(self) -> None:
+        for piece in self._splitter.flush():
+            self._put(piece)
+
+    def say(self, text: str) -> None:
+        """Speak a whole text (used for agent replies and error notices)."""
+        self.begin()
+        self.feed(text)
+        self.finish()
+
+    def _done_one(self) -> None:
+        with self._lock:
+            self._busy = max(0, self._busy - 1)
+
+    def _synth_loop(self) -> None:
+        while True:
+            gen, text = self._text_q.get()
+            self._synth_ready.wait()
+            if gen != self._gen:
+                self._done_one()
+                continue
+            self._n += 1
+            wav = os.path.join(session_dir(), f"say-{self._n}.wav")
+            try:
+                ok = self._synth(text, wav)
+            except Exception:
+                ok = False
+            if ok and gen == self._gen:
+                self._wav_q.put((gen, wav))
+            else:
+                self._done_one()
+
+    def _play_loop(self) -> None:
+        while True:
+            gen, wav = self._wav_q.get()
+            if gen == self._gen:
+                with self._lock:
+                    self._play = subprocess.Popen(
+                        [*self._player, wav], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    proc = self._play
+                if self.first_audio is None and self._started_at is not None:
+                    self.first_audio = time.time() - self._started_at
+                    self._first_event.set()
+                proc.wait()
+                with self._lock:
+                    self._play = None
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
+            self._done_one()
+
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy > 0
+
+    def stop(self) -> None:
+        """Silence now and drop everything queued."""
+        with self._lock:
+            self._gen += 1
+            if self._play is not None:
+                try:
+                    self._play.kill()
+                except Exception:
+                    pass
+        self._splitter = SentenceSplitter()
+
+    def wait_first_audio(self, timeout: float) -> float | None:
+        self._first_event.wait(timeout)
+        return self.first_audio
+
+    def wait_idle(self, timeout: float = 60) -> None:
+        end = time.time() + timeout
+        while self.busy() and time.time() < end:
+            time.sleep(0.05)
 
 
 HELP = f"""{BOLD}Commands{RESET}
@@ -893,13 +1078,18 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
         print(f"{DIM}transcript: {transcript.md}{RESET}")
     print()
 
+    speaker = Speaker(voice_path) if voice_path and tts_ready() else None
     try:
         while True:
             try:
                 line = input(f"{CYAN}{BOLD}you{RESET} ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
+                if speaker:
+                    speaker.wait_idle()
                 return 0
+            if speaker:
+                speaker.stop()      # barge-in
 
             if line.startswith("/"):
                 cmd, _, rest = line.partition(" ")
@@ -937,6 +1127,11 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
                         print(f"{YELLOW}voice {rest!r} not found - /voices to list{RESET}")
                     else:
                         voice_path, speaking = found, tts_ready()
+                        if speaking:
+                            if speaker:
+                                speaker.set_voice(found)
+                            else:
+                                speaker = Speaker(found)
                         print(f"{DIM}voice set to {rest}.{RESET}")
                 else:
                     print(f"{YELLOW}unknown command {cmd} - try /help{RESET}")
@@ -971,9 +1166,9 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
             res = out.get("result") or {}
             if reply and is_api_error(reply):
                 print(f"{RED}{reply}{RESET}")
-                if speaking and voice_path:
-                    speak("The model server returned an error. Details are on screen.",
-                          voice_path)
+                if speaking and speaker:
+                    speaker.say("The model server returned an error. "
+                                "Details are on screen.")
                 reply_for_log = None
             elif reply:
                 print(f"{GREEN}{BOLD}agent{RESET} {reply}")
@@ -983,8 +1178,8 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
                 if res.get("denials"):
                     print(f"{YELLOW}{len(res['denials'])} action(s) refused by the "
                           f"allowlist.{RESET}")
-                if speaking and voice_path:
-                    speak(spoken_summary(reply), voice_path)
+                if speaking and speaker:
+                    speaker.say(spoken_summary(reply))
                 reply_for_log = reply
             else:
                 reply_for_log = None
@@ -1028,6 +1223,9 @@ def main() -> int:
                     help="where the --llm-url model runs, told to the model so it "
                          "can answer truthfully (default: $NPU_CHAT_LLM_WHERE, "
                          "else 'this laptop' or 'a separate machine at HOST')")
+    ap.add_argument("--confirm", action="store_true",
+                    help="show each voice transcript and wait for Enter (send), "
+                         "x (discard) or a typed correction; always on with --harness")
     ap.add_argument("--no-transcript", action="store_true",
                     help=f"do not write a session transcript under {LOGDIR}")
     ap.add_argument("--harness", choices=["claude"], default=None,
@@ -1136,12 +1334,19 @@ def main() -> int:
         print(f"{DIM}transcript: {transcript.md}{RESET}")
     print()
 
+    speaker = Speaker(voice_path) if voice_path and tts_ready() else None
+
     while True:
         try:
             line = input(f"{CYAN}{BOLD}you{RESET} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            if speaker:
+                speaker.wait_idle()     # stdin closed: let the reply finish
             return 0
+        # Barge-in: any input silences the reply that is still being spoken.
+        if speaker:
+            speaker.stop()
 
         if line.startswith("/"):
             cmd, _, rest = line.partition(" ")
@@ -1187,6 +1392,11 @@ def main() -> int:
                     else:
                         voice_path = found
                         speaking = tts_ready()
+                        if speaking:
+                            if speaker:
+                                speaker.set_voice(found)
+                            else:
+                                speaker = Speaker(found)
                         history[0] = system_msg()
                         print(f"{DIM}voice set to {rest}.{RESET}")
             else:
@@ -1207,22 +1417,42 @@ def main() -> int:
             print(f"{CYAN}{BOLD}you{RESET} {said}")
             user_text = said
             via = "voice"
+            if args.confirm:
+                user_text = confirm_transcript(said)
+                if user_text is None:
+                    print(f"{DIM}discarded.{RESET}")
+                    if transcript:
+                        transcript.turn(meta(), via="voice-discarded", user=said,
+                                        assistant=None, audio_secs=audio_secs,
+                                        sent=False)
+                    continue
+                if user_text != said:
+                    via = "voice-corrected"
         else:
             user_text = line
 
         history.append({"role": "user", "content": user_text})
-        reply, ttft, total = stream_reply(model, history, llm_server)
+        voiced = bool(speaking and speaker)
+        if voiced:
+            speaker.begin()
+        reply, ttft, total = stream_reply(model, history, llm_server,
+                                          on_delta=speaker.feed if voiced else None)
+        first_audio = None
         if reply:
             history.append({"role": "assistant", "content": reply})
-            if speaking and voice_path:
-                speak(reply, voice_path)
+            if voiced:
+                speaker.finish()
+                first_audio = speaker.wait_first_audio(3.0)
         else:
             history.pop()
+            if voiced:
+                speaker.stop()
         if transcript:
             transcript.turn(meta(), via=via, user=user_text, assistant=reply or None,
                             audio_secs=audio_secs, model=model,
                             ttft_secs=round(ttft, 3) if ttft else None,
-                            total_secs=round(total, 3))
+                            total_secs=round(total, 3),
+                            first_audio_secs=round(first_audio, 3) if first_audio else None)
         print()
 
 
