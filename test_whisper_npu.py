@@ -551,3 +551,52 @@ def test_confirm_flag_exists_for_chat_mode():
     out = subprocess.run([sys.executable, "npu-chat", "--help"],
                          capture_output=True, text=True, check=True)
     assert "--confirm" in out.stdout
+
+
+# --- speech gate (Silero VAD) ---------------------------------------------------
+
+def _wav16k(path, samples):
+    import array
+    import wave as w
+
+    with w.open(str(path), "wb") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(16000)
+        fh.writeframes(array.array("h", samples).tobytes())
+    return str(path)
+
+
+def test_vad_off_without_model(tmp_path):
+    """No model -> no filtering (the pre-gate behaviour), never a crash."""
+    m = _load_chat()
+    m.VAD_MODEL = str(tmp_path / "missing.onnx")
+    assert m.vad_peak(_wav16k(tmp_path / "s.wav", [0] * 16000)) is None
+
+
+def test_vad_scores_silence_low_and_speech_high(tmp_path):
+    import pytest
+
+    m = _load_chat()
+    if not os.path.exists(m.VAD_MODEL):
+        pytest.skip("Silero VAD model not installed")
+    silence = _wav16k(tmp_path / "silence.wav", [0] * 32000)
+    if m.vad_peak(silence) is None:
+        pytest.skip("numpy/onnxruntime not importable here")
+    assert m.vad_peak(silence) < m.VAD_MIN
+    voice = m.find_voice(m.DEFAULT_VOICE)
+    if not (voice and shutil.which("piper-tts") and shutil.which("ffmpeg")):
+        pytest.skip("piper voice not available to synthesise speech")
+    raw, speech = tmp_path / "raw.wav", tmp_path / "speech.wav"
+    subprocess.run(["piper-tts", "-m", voice, "-f", str(raw)],
+                   input=b"Fix the bug in the stats module and run the tests.",
+                   capture_output=True, check=True)
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(raw),
+                    "-ar", "16000", "-ac", "1", str(speech)], check=True)
+    assert m.vad_peak(str(speech)) > 0.9
+
+
+def test_vad_threshold_sits_between_measured_noise_and_quiet_speech():
+    """Measured on this mic: noise peaked <= 0.074, quiet speech >= 0.163."""
+    m = _load_chat()
+    assert 0.074 < m.VAD_MIN < 0.163

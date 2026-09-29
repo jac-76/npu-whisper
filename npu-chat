@@ -47,6 +47,20 @@ DEFAULT_VOICE = os.environ.get("NPU_CHAT_VOICE", "en_GB-alan-medium")
 # every threshold tried (-40, -30, -25, -20 dB) on a padded sample. -30 dB is
 # the conservative default; -25 dB cuts far more if you want it.
 TRIM_DB = os.environ.get("NPU_CHAT_TRIM_DB", "-30dB")
+# Speech gate (Silero VAD) ahead of whisper, which invents sentences from room
+# noise. Calibrated on this mic, peak speech probability per capture:
+#   room noise x6        0.011 - 0.074   (whisper still wrote "Thank you." etc.)
+#   quiet speech x3      0.163 - 0.414   (whisper transcribed it correctly)
+#   normal speech x3     0.954 - 0.997
+# Silero's usual 0.5 would have thrown the quiet speech away, so a capture is
+# kept if any 32 ms frame reaches VAD_MIN, set between the two groups.
+VAD_MODEL = os.path.expanduser(os.environ.get(
+    "NPU_CHAT_VAD_MODEL", "~/.local/share/silero-vad/silero_vad.onnx"))
+VAD_MIN = float(os.environ.get("NPU_CHAT_VAD_MIN", "0.12"))
+VAD_ON = os.environ.get("NPU_CHAT_VAD", "1") != "0"
+# What the last capture's speech check found; the loop logs it per turn so
+# the threshold can be re-checked against real use.
+LAST_CAPTURE: dict = {}
 LOGDIR = os.path.expanduser(
     os.environ.get("NPU_CHAT_LOGDIR", "~/.local/state/npu-chat")
 )
@@ -254,6 +268,16 @@ def record_until_enter() -> str | None:
     )
     clip = wav if norm.returncode == 0 and os.path.exists(wav) else raw
 
+    LAST_CAPTURE.clear()
+    peak = vad_peak(clip) if VAD_ON else None
+    if peak is not None:
+        LAST_CAPTURE["vad_max_p"] = round(peak, 3)
+        if peak < VAD_MIN:
+            LAST_CAPTURE["vad_discarded"] = True
+            print(f"{YELLOW}no speech detected (peak {peak:.2f} < {VAD_MIN}) "
+                  f"- discarded.{RESET}")
+            return None
+
     # Enter-to-start/Enter-to-stop records while the user thinks, so most of a
     # capture is dead air. Trimming it cuts what the NPU has to chew on; the
     # transcript was identical with and without on every threshold tested.
@@ -281,6 +305,59 @@ def record_until_enter() -> str | None:
         print(f"{YELLOW}only {dur:.2f}s of audio - discarded.{RESET}")
         return None
     return clip
+
+
+_VAD = {"session": None, "warned": False}
+
+
+def vad_probs(path: str) -> list[float] | None:
+    """Silero VAD speech probability per 32 ms frame of a 16 kHz mono WAV.
+
+    None when the model or onnxruntime is unavailable - then nothing is
+    filtered, which is how npu-chat behaved before the gate existed.
+    """
+    if _VAD["session"] is None:
+        try:
+            import numpy  # noqa: F401
+            import onnxruntime as ort
+            if not os.path.exists(VAD_MODEL):
+                raise FileNotFoundError(VAD_MODEL)
+            _VAD["session"] = ort.InferenceSession(
+                VAD_MODEL, providers=["CPUExecutionProvider"])
+        except Exception as exc:
+            if not _VAD["warned"]:
+                print(f"{DIM}speech gate off ({exc}); noise is not filtered. "
+                      f"See README, Silero VAD.{RESET}")
+                _VAD["warned"] = True
+            return None
+    import numpy as np
+
+    try:
+        with wave.open(path, "rb") as w:
+            if w.getframerate() != 16000 or w.getnchannels() != 1:
+                return None
+            x = np.frombuffer(w.readframes(w.getnframes()),
+                              dtype=np.int16).astype(np.float32) / 32768
+    except Exception:
+        return None
+    sess = _VAD["session"]
+    state = np.zeros((2, 1, 128), np.float32)
+    ctx = np.zeros((1, 64), np.float32)          # Silero v5+ wants 64 samples of context
+    sr = np.array(16000, np.int64)
+    out = []
+    for i in range(0, len(x) - 511, 512):
+        inp = np.concatenate([ctx, x[None, i:i + 512]], axis=1)
+        p, state = sess.run(None, {"input": inp, "state": state, "sr": sr})
+        ctx = inp[:, -64:]
+        out.append(float(p[0, 0]))
+    return out
+
+
+def vad_peak(path: str) -> float | None:
+    probs = vad_probs(path)
+    if probs is None:
+        return None
+    return max(probs) if probs else 0.0
 
 
 def wav_duration(path: str) -> float | None:
@@ -1142,6 +1219,10 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
             if line == "":
                 clip = record_until_enter()
                 if not clip:
+                    if transcript and LAST_CAPTURE.get("vad_discarded"):
+                        transcript.turn(meta(), via="vad-discarded", user=None,
+                                        assistant=None, sent=False,
+                                        vad_max_p=LAST_CAPTURE.get("vad_max_p"))
                     continue
                 audio_secs = wav_duration(clip)
                 said = transcribe(clip)
@@ -1155,7 +1236,8 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
                     if transcript:
                         transcript.turn(meta(), via="voice-discarded", user=said,
                                         assistant=None, audio_secs=audio_secs,
-                                        sent=False)
+                                        sent=False,
+                                        vad_max_p=LAST_CAPTURE.get("vad_max_p"))
                     continue
                 via = "voice" if user_text == said else "voice-corrected"
             else:
@@ -1195,7 +1277,9 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
                                 denials=len(res.get("denials") or []),
                                 total_secs=round(out["total"], 3),
                                 stopped=out.get("stopped", False),
-                                error=out.get("error"))
+                                error=out.get("error"),
+                                vad_max_p=(LAST_CAPTURE.get("vad_max_p")
+                                           if audio_secs else None))
             print()
     finally:
         harness.stop()
@@ -1408,6 +1492,10 @@ def main() -> int:
         if line == "":
             clip = record_until_enter()
             if not clip:
+                if transcript and LAST_CAPTURE.get("vad_discarded"):
+                    transcript.turn(meta(), via="vad-discarded", user=None,
+                                    assistant=None, sent=False,
+                                    vad_max_p=LAST_CAPTURE.get("vad_max_p"))
                 continue
             audio_secs = wav_duration(clip)
             said = transcribe(clip)
@@ -1424,7 +1512,8 @@ def main() -> int:
                     if transcript:
                         transcript.turn(meta(), via="voice-discarded", user=said,
                                         assistant=None, audio_secs=audio_secs,
-                                        sent=False)
+                                        sent=False,
+                                        vad_max_p=LAST_CAPTURE.get("vad_max_p"))
                     continue
                 if user_text != said:
                     via = "voice-corrected"
@@ -1452,7 +1541,8 @@ def main() -> int:
                             audio_secs=audio_secs, model=model,
                             ttft_secs=round(ttft, 3) if ttft else None,
                             total_secs=round(total, 3),
-                            first_audio_secs=round(first_audio, 3) if first_audio else None)
+                            first_audio_secs=round(first_audio, 3) if first_audio else None,
+                            vad_max_p=LAST_CAPTURE.get("vad_max_p") if audio_secs else None)
         print()
 
 

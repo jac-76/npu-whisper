@@ -369,7 +369,27 @@ Replies are spoken by default with [piper](https://github.com/rhasspy/piper)
 `~/.local/share/piper` then `~/.local/share/piper-voices`; `/voices` lists what
 is installed and `/voice NAME` switches at runtime. `--no-speak` turns it off.
 
-Measured here: 859 ms to synthesise 2.65 s of speech (RTF ≈ 0.32) at 22.05 kHz.
+**Speech starts on the first sentence, not after the whole reply.** Text is cut
+into sentences as it streams, one thread synthesises and another plays, so
+sentence two is synthesised while sentence one is heard. piper runs in-process
+with the voice loaded once. A `piper-tts` process per call spent 0.75 s
+reloading the model every time, while in-process synthesis of the same sentence
+took 0.06 s. Fenced code is never read aloud.
+
+Time from sending a turn to the first audio, desktop `qwen3.5:9b-16k`, warm:
+
+| reply | before (whole reply, then a piper process) | now, live |
+|---|---|---|
+| "What is 17 times 3?" | 1.19 s | **0.36 s** |
+| Ohio, one sentence | 1.72 s | **0.58 s** |
+| heat pump, several sentences | 2.36 s | **0.64 s** (reply took 2.3 s) |
+
+Each turn logs `first_audio_secs` in the session JSONL.
+
+**Barge-in:** press Enter (or type anything) while it is talking and playback
+stops at once, queued sentences are dropped, and your next recording starts.
+Measured live: 0.4 s after a new question, the old answer was silent and the
+new one was playing.
 
 TTS is the one part that is **not** on the NPU — FastFlowLM offers only `--asr`
 and `--embed`, no synthesis — so piper runs on the CPU. Recognition and
@@ -378,12 +398,40 @@ generation stay on the NPU.
 One trap worth repeating: **never pass `--output-raw` to `piper-tts`.** It
 redirects audio to stdout and leaves `-f` empty, so playback gets silence.
 
-### Same hallucination caveat
+### Speech gate: Silero VAD ahead of whisper
 
-`npu-chat` shows you the transcript before it sends anything, so a bad
-recognition is visible rather than silent. See the `npu-dictate` section below
-for why non-speech audio produces invented sentences and why no gate is
-available.
+whisper large-v3-turbo invents text from room noise, so every capture is
+checked for speech first ([Silero VAD](https://github.com/snakers4/silero-vad)
+v6.2.3, ONNX, on the CPU). A capture with no speech is discarded before it
+reaches whisper or the model. Install the model once:
+
+```sh
+mkdir -p ~/.local/share/silero-vad
+curl -L -o ~/.local/share/silero-vad/silero_vad.onnx \
+  https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.3/src/silero_vad/data/silero_vad.onnx
+```
+
+Without it (or without `numpy`/`onnxruntime`) npu-chat says the gate is off and
+behaves as before. `NPU_CHAT_VAD=0` turns it off deliberately.
+
+**The threshold was measured on this microphone, and the usual one is wrong
+here.** Peak speech probability per capture:
+
+| capture | peak probability | Silero's usual 0.5 | whisper said |
+|---|---|---|---|
+| room noise ×6 | 0.011 – 0.074 | rejected | "Thank you.", "E aí", "Продолжение следует..." |
+| quiet speech ×3 | 0.163 – 0.414 | **rejected** | the right words (2 of 3 exact) |
+| normal speech ×3 | 0.954 – 0.997 | kept | the right words |
+
+At 0.5, quiet but perfectly intelligible speech would be thrown away. So a
+capture is kept if any 32 ms frame reaches **0.12** (`NPU_CHAT_VAD_MIN`),
+between the two groups. The "speech" here is piper played through the laptop
+speakers and heard by the mic, not a person, and there are few samples. Each
+capture's `vad_max_p` is logged, including discards (`"via": "vad-discarded"`),
+so the threshold can be re-checked against real use.
+
+`--confirm` adds the agent mode's prompt to chat mode: see the transcript,
+Enter to send, `x` to discard, or type a correction.
 
 ## Push-to-talk dictation (`npu-dictate`)
 
@@ -487,7 +535,7 @@ curl http://127.0.0.1:52625/v1/audio/transcriptions -F file=@clip.ogg -F model=w
 ## Tests
 
 ```sh
-python3 -m venv .venv && ./.venv/bin/pip install pytest
+python3 -m venv --system-site-packages .venv && ./.venv/bin/pip install pytest
 ./.venv/bin/python -m pytest
 ```
 
