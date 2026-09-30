@@ -249,6 +249,85 @@ python3 bench_llm.py --no-think --url http://192.168.1.36:11434 \
   --model qwen3.5:9b-16k --model granite4.2:3b-32k
 ```
 
+### Web search and grow status (tools)
+
+With an ollama model, npu-chat gives the model two tools. It asks whether the
+server is ollama, because that is the only server it was measured on.
+
+- **`web_search`** goes to a self-hosted [SearXNG](https://github.com/searxng/searxng)
+  on the laptop (`NPU_CHAT_SEARX_URL`, default `http://127.0.0.1:8888`). The
+  top 8 results go back to the model, plus SearXNG's direct answers when
+  there are any. **Searching sends your question to the public search engines**,
+  from your IP but not tied to any account. That is the one thing in npu-chat
+  that leaves the LAN, and a `· searching: …` line shows every time it happens.
+- **`grow_status`** reads what the grow daemons have already cached
+  (`acinf bar`, `vivosun bar`, `yinmik bar`, 0.05 s). It never polls the cloud
+  APIs, because AC Infinity answers extra polling with `403`.
+
+`--no-tools` turns both off. You hear "Let me check." while it looks things up.
+
+**Don't leave it to the model to decide when to look.** On a set of 8 current
+facts, each answer checked by hand against at least two sources (the 2026 Super
+Bowl, World Cup, NBA title, Masters, Fed chair, Stanley Cup, Kentucky Derby and
+Ohio State's opener), 3 fresh runs each, `qwen3.5:9b-16k`:
+
+| version | correct | searched |
+|---|---|---|
+| model decides when to search | 13/24 | 21/24 |
+| + year in the tool description, more results | 13/24 | 15/24 |
+| **npu-chat searches first when the question is about the present** | **21/24** | 24/24 |
+
+When it decided alone, the model answered "Jerome Powell" three times out of three
+without searching. It searched "who won the Masters this year **2024**" in 2026.
+And after finding "Seahawks 29–13" it called that "an alternate timeline" and gave
+its training-era answer instead. So a question with words like *who won*,
+*this year*, *latest*, *current* or *price of* is now searched by npu-chat
+itself, with the year added, and the results are attached to your message. The
+model can still search again on its own. Grow questions work the same way:
+left to the model, 1 of 3 runs said "I can't see real-time grow room
+readings". With the readings attached whenever you mention the tent,
+reservoir, pH, humidity and so on, it got 6 of 6.
+
+The three remaining misses were all the Fed chair. At that moment the search
+engines returned furniture ("chairs") and Powell's official bio, not the news
+of his successor. Engines don't return the same results twice: a few minutes
+later the same query did find it. Median time to answer was 2.2 s, search
+included.
+
+**Engines block heavy use.** About 150 searches in 30 minutes got Brave and
+Google CSE rate-limited and DuckDuckGo blocked, which left zero results. With
+nothing to go on, the model said it "couldn't find" things rather than
+inventing them. SearXNG now also queries Bing, Google and Qwant, and when every
+engine is refusing, the tool result says *search is unavailable*, so the model
+says that instead of claiming nothing exists.
+
+Any advice the model adds on top of the grow readings is its own opinion, not a
+rule anyone gave it. Asked the same question, it called pH 5.8 "a bit low" in one
+run and "perfect" in another.
+
+SearXNG setup used here, local only:
+
+```sh
+mkdir -p ~/.config/searxng && openssl rand -hex 32 > ~/.config/searxng/secret
+# settings.yml: use_default_settings: true; server.limiter: false;
+# search.formats: [html, json]; enable bing, google, qwant under engines:
+docker run -d --name searxng --restart unless-stopped \
+  -p 127.0.0.1:8888:8080 \
+  -v ~/.config/searxng/settings.yml:/etc/searxng/settings.yml:ro \
+  -e SEARXNG_BASE_URL=http://127.0.0.1:8888/ \
+  -e "SEARXNG_SECRET=$(cat ~/.config/searxng/secret)" searxng/searxng:latest
+```
+
+Mount the settings file read-only. With the directory mounted read-write, the
+container changed the file's owner to its own user.
+
+### Picking up where you left off (`--resume`)
+
+`npu-chat --resume` reloads the user/assistant turns of the most recent chat
+session from its transcript and keeps writing to the same file. Discarded and
+failed turns are skipped, and so are agent-mode sessions. Search results and
+grow readings are not restored, only what was said.
+
 ### Talking to a coding agent (`--harness claude`)
 
 The same push-to-talk loop can drive **Claude Code** instead of a chat model.

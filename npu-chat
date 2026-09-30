@@ -84,6 +84,273 @@ def llm_where_default(llm_url: str) -> str:
     return f"a separate machine at {host}"
 
 
+# --- tools the chat model can call (ollama only) ------------------------------
+# qwen3.5 on ollama returned real tool calls in every probe; FastFlowLM's
+# gemma3:1b ignored them and invented results, so tools are offered only to
+# ollama. Web search goes to a local SearXNG; grow status reads the snapshots
+# the grow daemons already cache (`<tool> bar`), never polling the cloud APIs:
+# AC Infinity answers extra polling with 403.
+
+SEARX_URL = os.environ.get("NPU_CHAT_SEARX_URL", "http://127.0.0.1:8888")
+MAX_TOOL_ROUNDS = 3
+GROW_TOOLS = (("acinf", "AC Infinity controller"),
+              ("vivosun", "VIVOSUN GrowHub"),
+              ("yinmik", "YINMIK reservoir meter"))
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "web_search",
+        # {year} is filled in per request (tools_for()). Measured: without it
+        # qwen3.5:9b searched "who won the Masters this year 2024" in 2026.
+        "description": "Search the web for current or specific facts: news, sports, "
+                       "prices, events, anything after your training or that you are "
+                       "unsure of. It is {year}: for anything recent put {year} in the "
+                       "query, never an older year you remember. Returns result "
+                       "titles, URLs and snippets.",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string",
+                                                "description": "search terms"}},
+                       "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "grow_status",
+        "description": "Current readings from the user's grow setup: the AC Infinity "
+                       "controller (tent temperature, humidity, VPD, fan ports; its "
+                       "humidity is the authoritative one), the VIVOSUN GrowHub "
+                       "(temperature, humidity, light and fan levels) and the YINMIK "
+                       "reservoir meter (pH, EC, ppm, water temperature). Read-only.",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+def tools_for(today: time.struct_time | None = None) -> list[dict]:
+    """TOOLS with the current year written into the search description."""
+    year = str((today or time.localtime()).tm_year)
+    out = json.loads(json.dumps(TOOLS))
+    fn = out[0]["function"]
+    fn["description"] = fn["description"].replace("{year}", year)
+    return out
+
+
+TOOLS_HINT = (
+    " You have tools. Use web_search for anything current, recent or that you are "
+    "not sure of, then answer from the results and say which site it came from. "
+    "Search results are newer than your training: when they disagree with what "
+    "you remember, the results are right, so report them without doubting them. "
+    "If the results do not contain the answer, search again with a more specific "
+    "query that includes the year, instead of answering from memory. "
+    "Use grow_status for any question about the grow, tent, plants, reservoir, pH, "
+    "EC, humidity or temperature there, and call it again every time, because the "
+    "readings change. Today is {today}."
+)
+
+
+def web_search(query: str, n: int = 8) -> str:
+    url = f"{SEARX_URL}/search?" + urllib.parse.urlencode({"q": query, "format": "json"})
+    try:
+        d = json.loads(urllib.request.urlopen(url, timeout=15).read())
+    except Exception as exc:
+        return f"web search failed: {exc}"
+    results = d.get("results") or []
+    lines = []
+    # SearXNG's direct answers and infoboxes, when an engine gives one, are the
+    # most specific thing it returns; put them first.
+    for a in d.get("answers") or []:
+        text = a.get("answer") if isinstance(a, dict) else str(a)
+        if text:
+            lines.append(f"Answer: {' '.join(str(text).split())[:300]}")
+    for box in (d.get("infoboxes") or [])[:1]:
+        body = " ".join((box.get("content") or "").split())[:400]
+        if body:
+            lines.append(f"Infobox ({box.get('infobox', '')}): {body}")
+    if not results and not lines:
+        down = [f"{e[0]}: {e[1]}" for e in d.get("unresponsive_engines") or []
+                if isinstance(e, (list, tuple)) and len(e) >= 2]
+        if down:
+            # Measured: every engine suspended after heavy use left "no results"
+            # for everything, and the model then told the user nothing existed.
+            return ("SEARCH UNAVAILABLE - the search engines are refusing requests "
+                    f"right now ({'; '.join(down)}). Tell the user web search is "
+                    "down; do not say the thing could not be found.")
+        return "no results"
+    for i, r in enumerate(results[:n], 1):
+        snippet = " ".join((r.get("content") or "").split())[:300]
+        lines.append(f"{i}. {r.get('title', '').strip()} - {r.get('url', '')}\n   {snippet}")
+    return "\n".join(lines)
+
+
+def grow_status() -> str:
+    out = []
+    for cmd, label in GROW_TOOLS:
+        if not shutil.which(cmd):
+            out.append(f"{label}: not installed")
+            continue
+        try:
+            r = subprocess.run([cmd, "bar"], capture_output=True, text=True, timeout=10)
+            # The bar JSON carries raw newlines inside strings; strict=False takes them.
+            d = json.loads(r.stdout.strip(), strict=False)
+            out.append((d.get("tooltip") or d.get("text") or "").strip())
+        except Exception as exc:
+            out.append(f"{label}: unavailable ({exc})")
+    return "\n".join(out)
+
+
+# Asked about the grow -> fetch the readings ourselves. Left to qwen3.5:9b,
+# 1 of 3 runs answered "I can't see real-time grow room readings" without
+# calling grow_status, and later turns reused an old result instead of
+# re-reading. The tool stays for phrasings this list misses.
+GROW_WORDS = re.compile(
+    r"\b(grow|tent|reservoir|res|ph|ec|ppm|tds|humidity|humid|rh|vpd|"
+    r"temperature|temp|plants?|fans?|light|nutrients?|water)\b", re.I)
+
+
+def with_grow_context(text: str) -> tuple[str, bool]:
+    """User message plus fresh grow readings when the grow is mentioned."""
+    if not GROW_WORDS.search(text):
+        return text, False
+    return (f"{text}\n\n[Grow readings fetched just now - use these, they are "
+            f"current]\n{grow_status()}"), True
+
+
+# Questions about the present -> search first, ourselves. The search-routing
+# eval (8 verified 2026 facts x 3 runs) scored 13/24 when qwen3.5:9b decided
+# alone: it answered "Jerome Powell" for Fed chair 3/3 without searching.
+CURRENT_WORDS = re.compile(
+    r"\b(latest|most recent|recent|recently|current|currently|right now|today|"
+    r"tonight|yesterday|this (year|season|week|month|weekend)|last (night|week)|"
+    r"who won|who is the|who's the|news|price of|prices|score|standings|"
+    r"next (game|match|race|election))\b", re.I)
+
+
+def search_query_for(text: str, year: int) -> str:
+    """The user's own words as the query, with the year added if missing."""
+    q = " ".join(text.split())
+    return q if re.search(r"\b(19|20)\d\d\b", q) else f"{q} {year}"
+
+
+def with_search_context(text: str, year: int) -> tuple[str, str | None]:
+    if not CURRENT_WORDS.search(text):
+        return text, None
+    q = search_query_for(text, year)
+    return (f"{text}\n\n[Web results for '{q}', fetched just now. They are newer "
+            f"than your training; answer from them and name the site]\n"
+            f"{web_search(q)}"), q
+
+
+def describe_call(name: str, args: dict) -> str:
+    if name == "web_search":
+        return f"searching: {args.get('query', '')}"
+    if name == "grow_status":
+        return "reading grow status"
+    return f"{name} {json.dumps(args)}"
+
+
+def run_tool(name: str, raw_args: str) -> tuple[dict, str]:
+    try:
+        args = json.loads(raw_args or "{}")
+        if not isinstance(args, dict):
+            args = {}
+    except json.JSONDecodeError:
+        return {}, f"could not parse arguments: {raw_args!r}"
+    if name == "web_search":
+        q = str(args.get("query") or "").strip()
+        return args, web_search(q) if q else "empty query"
+    if name == "grow_status":
+        return args, grow_status()
+    return args, f"unknown tool {name}"
+
+
+def latest_chat_log(logdir: str) -> str | None:
+    """Newest chat-mode session JSONL with at least one answered turn.
+
+    Agent-mode sessions log a Claude Code session_id per turn; they are not
+    chat history and are skipped.
+    """
+    import glob
+
+    paths = sorted(glob.glob(os.path.join(logdir, "*.jsonl")),
+                   key=os.path.getmtime, reverse=True)
+    for path in paths:
+        try:
+            recs = [json.loads(x) for x in open(path, encoding="utf-8") if x.strip()]
+        except (OSError, json.JSONDecodeError):
+            continue
+        if any("session_id" in r for r in recs):
+            continue
+        if any(r.get("user") and r.get("assistant") for r in recs):
+            return path
+    return None
+
+
+def history_from_log(path: str) -> list[dict]:
+    """The user/assistant turns of a session; discarded and failed turns skipped."""
+    msgs: list[dict] = []
+    for line in open(path, encoding="utf-8"):
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r.get("user") and r.get("assistant") and r.get("sent", True):
+            msgs.append({"role": "user", "content": r["user"]})
+            msgs.append({"role": "assistant", "content": r["assistant"]})
+    return msgs
+
+
+def chat_turn(model: str, history: list[dict], user_text: str,
+              server: str | None, tools_on: bool, on_delta=None,
+              log=print) -> tuple[str, float | None, list[dict], bool]:
+    """One user turn, tool calls included. Mutates `history`.
+
+    Returns (reply, time to first text, tools used, grow readings attached).
+    On an empty reply the caller rolls history back.
+    """
+    content, grow_attached = (with_grow_context(user_text) if tools_on
+                              else (user_text, False))
+    if grow_attached:
+        log(f"{DIM}· reading grow status{RESET}")
+    used: list[dict] = []
+    if tools_on:
+        year = time.localtime().tm_year
+        if CURRENT_WORDS.search(user_text):
+            log(f"{DIM}· searching: {search_query_for(user_text, year)}{RESET}")
+            if on_delta:
+                on_delta("Let me check. ")
+        content, q = with_search_context(content, year)
+        if q:
+            used.append({"name": "web_search", "args": {"query": q}, "auto": True})
+    history.append({"role": "user", "content": content})
+    t_turn = time.time()
+    ttft = None
+    reply = ""
+    for round_ in range(MAX_TOOL_ROUNDS + 1):
+        calls: list[dict] = []
+        offer = tools_for() if tools_on and round_ < MAX_TOOL_ROUNDS else None
+        t_round = time.time()
+        reply, r_ttft, _ = stream_reply(model, history, server, on_delta=on_delta,
+                                        tools=offer, calls_out=calls)
+        if r_ttft is not None and ttft is None:
+            ttft = (t_round - t_turn) + r_ttft
+        if not calls:
+            break
+        if on_delta and not used:
+            on_delta("Let me check. ")    # something to hear while it looks
+        history.append({"role": "assistant", "content": reply or "",
+                        "tool_calls": [
+                            {"id": c["id"] or f"call_{round_}_{i}", "type": "function",
+                             "function": {"name": c["name"],
+                                          "arguments": c["arguments"] or "{}"}}
+                            for i, c in enumerate(calls)]})
+        for i, c in enumerate(calls):
+            try:
+                preview = json.loads(c["arguments"] or "{}")
+            except json.JSONDecodeError:
+                preview = {}
+            log(f"{DIM}· {describe_call(c['name'], preview if isinstance(preview, dict) else {})}{RESET}")
+            args_used, result = run_tool(c["name"], c["arguments"])
+            used.append({"name": c["name"], "args": args_used})
+            history.append({"role": "tool",
+                            "tool_call_id": c["id"] or f"call_{round_}_{i}",
+                            "content": result})
+    return reply, ttft, used, grow_attached
+
+
 def prewarm(llm_url: str, model: str, server: str | None) -> None:
     """Ask ollama to load the model now, in the background.
 
@@ -432,13 +699,18 @@ def request_body(model: str, history: list[dict], server: str | None) -> dict:
 
 
 def stream_reply(model: str, history: list[dict], server: str | None = None,
-                 on_delta=None) -> tuple[str, float | None, float]:
+                 on_delta=None, tools: list[dict] | None = None,
+                 calls_out: list | None = None) -> tuple[str, float | None, float]:
     """Stream a chat completion, printing tokens as they arrive.
 
     on_delta gets each piece of text too, so speech can start on the first
-    sentence instead of waiting for the whole reply.
+    sentence instead of waiting for the whole reply. With `tools`, any tool
+    calls the model makes are collected into `calls_out`.
     """
-    body = json.dumps(request_body(model, history, server)).encode()
+    payload_body = request_body(model, history, server)
+    if tools:
+        payload_body["tools"] = tools
+    body = json.dumps(payload_body).encode()
     req = urllib.request.Request(
         f"{LLM_URL}/v1/chat/completions",
         data=body,
@@ -447,9 +719,10 @@ def stream_reply(model: str, history: list[dict], server: str | None = None,
     out: list[str] = []
     first: float | None = None
     start = time.time()
+    partial: dict[int, dict] = {}
+    labelled = False
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
-            print(f"{GREEN}{BOLD}npu{RESET} ", end="", flush=True)
             for line in resp:
                 text = line.decode("utf-8", "replace").strip()
                 if not text.startswith("data:"):
@@ -461,11 +734,24 @@ def stream_reply(model: str, history: list[dict], server: str | None = None,
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
-                delta = chunk["choices"][0].get("delta", {}).get("content")
+                d = chunk["choices"][0].get("delta", {})
+                for tc in d.get("tool_calls") or []:
+                    # ollama sends each call whole; OpenAI-style servers send
+                    # the arguments in fragments keyed by index. Merge both.
+                    slot = partial.setdefault(tc.get("index", len(partial)),
+                                              {"id": "", "name": "", "arguments": ""})
+                    slot["id"] = tc.get("id") or slot["id"]
+                    fn = tc.get("function") or {}
+                    slot["name"] = fn.get("name") or slot["name"]
+                    slot["arguments"] += fn.get("arguments") or ""
+                delta = d.get("content")
                 if not delta:
                     continue
                 if first is None:
                     first = time.time() - start
+                if not labelled:
+                    print(f"{GREEN}{BOLD}npu{RESET} ", end="", flush=True)
+                    labelled = True
                 out.append(delta)
                 sys.stdout.write(delta)
                 sys.stdout.flush()
@@ -479,6 +765,10 @@ def stream_reply(model: str, history: list[dict], server: str | None = None,
         return "", None, time.time() - start
     reply = "".join(out).strip()
     total = time.time() - start
+    if calls_out is not None:
+        calls_out.extend(partial[i] for i in sorted(partial))
+    if partial and not reply:
+        return reply, first, total
     if reply:
         ttft = f"{first:.2f}s" if first is not None else "n/a"
         print(f"\n{DIM}[{model} - first token {ttft}, total {total:.2f}s]{RESET}")
@@ -1331,6 +1621,11 @@ def main() -> int:
                     help="where the --llm-url model runs, told to the model so it "
                          "can answer truthfully (default: $NPU_CHAT_LLM_WHERE, "
                          "else 'this laptop' or 'a separate machine at HOST')")
+    ap.add_argument("--no-tools", action="store_true",
+                    help="do not offer the model web search or grow status "
+                         "(tools are only offered to ollama servers)")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue the most recent chat session from its transcript")
     ap.add_argument("--confirm", action="store_true",
                     help="show each voice transcript and wait for Enter (send), "
                          "x (discard) or a typed correction; always on with --harness")
@@ -1364,6 +1659,8 @@ def main() -> int:
             return 1
     elif args.workdir or args.agent_allow:
         ap.error("--workdir and --agent-allow only apply with --harness")
+    if args.harness and args.resume:
+        ap.error("--resume is for chat mode; agent sessions are not resumable yet")
 
     global LLM_URL
     if args.llm_url:
@@ -1401,13 +1698,17 @@ def main() -> int:
               f"{' or '.join(VOICE_DIRS)}.{RESET}")
         speaking = False
 
+    tools_on = not args.no_tools and llm_server == "ollama"
+
     def system_msg() -> dict:
         voice_id = (os.path.basename(voice_path)[:-5]
                     if speaking and voice_path else None)
+        hint = (TOOLS_HINT.format(today=time.strftime("%A %B %-d, %Y"))
+                if tools_on else "")
         return {"role": "system",
                 "content": args.system + self_facts(model, voice_id,
                                                     LLM_URL == URL,
-                                                    llm_server, llm_where)}
+                                                    llm_server, llm_where) + hint}
 
     history = [system_msg()]
 
@@ -1419,6 +1720,16 @@ def main() -> int:
 
     if args.harness:
         return harness_loop(args, model, workdir, voice_path, speaking, transcript)
+
+    resumed_from = None
+    if args.resume:
+        resumed_from = latest_chat_log(LOGDIR)
+        if resumed_from is None:
+            print(f"{YELLOW}nothing to resume in {LOGDIR}.{RESET}")
+        else:
+            history += history_from_log(resumed_from)
+            if transcript:
+                transcript = Transcript(resumed_from[:-len(".jsonl")])  # one record
 
     def meta() -> dict:
         return {
@@ -1438,10 +1749,17 @@ def main() -> int:
               f"{llm_where}){RESET}")
     voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
                   if speaking and voice_path else "voice off")
-    print(f"{DIM}model {model} | {voice_note} | press Enter to talk, "
+    tools_note = " | tools: web search, grow status" if tools_on else ""
+    print(f"{DIM}model {model} | {voice_note}{tools_note} | press Enter to talk, "
           f"/help for commands{RESET}")
     if transcript:
         print(f"{DIM}transcript: {transcript.md}{RESET}")
+    if resumed_from:
+        turns = (len(history) - 1) // 2
+        print(f"{DIM}resumed {turns} turn(s) from {os.path.basename(resumed_from)}{RESET}")
+        if turns:
+            print(f"{DIM}  you: {history[-2]['content'][:100]}{RESET}")
+            print(f"{DIM}  npu: {history[-1]['content'][:100]}{RESET}")
     print()
 
     speaker = Speaker(voice_path) if voice_path and tts_ready() else None
@@ -1548,12 +1866,15 @@ def main() -> int:
         else:
             user_text = line
 
-        history.append({"role": "user", "content": user_text})
+        turn_start = len(history)
         voiced = bool(speaking and speaker)
         if voiced:
             speaker.begin()
-        reply, ttft, total = stream_reply(model, history, llm_server,
-                                          on_delta=speaker.feed if voiced else None)
+        t_turn = time.time()
+        reply, ttft, used, grow_attached = chat_turn(
+            model, history, user_text, llm_server, tools_on,
+            on_delta=speaker.feed if voiced else None)
+        total = time.time() - t_turn
         first_audio = None
         if reply:
             history.append({"role": "assistant", "content": reply})
@@ -1561,7 +1882,7 @@ def main() -> int:
                 speaker.finish()
                 first_audio = speaker.wait_first_audio(3.0)
         else:
-            history.pop()
+            del history[turn_start:]
             if voiced:
                 speaker.stop()
         if transcript:
@@ -1569,6 +1890,8 @@ def main() -> int:
                             audio_secs=audio_secs, model=model,
                             ttft_secs=round(ttft, 3) if ttft else None,
                             total_secs=round(total, 3),
+                            tools=used or None,
+                            grow_attached=grow_attached or None,
                             first_audio_secs=round(first_audio, 3) if first_audio else None,
                             vad_max_p=LAST_CAPTURE.get("vad_max_p") if audio_secs else None)
         print()

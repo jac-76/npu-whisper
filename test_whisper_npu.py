@@ -636,3 +636,215 @@ def test_prewarm_loads_on_ollama_only(tmp_path):
         assert hits == [("/api/generate", {"model": "qwen3.5:9b-16k"})]
     finally:
         srv.shutdown()
+
+
+# --- tools: web search, grow status, routing ------------------------------------
+
+def _post_stub(handler_fn):
+    """HTTP stub; handler_fn(path, body_dict) -> (content_type, bytes)."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def _reply(self, body):
+            ctype, data = handler_fn(self.path, body)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._reply(None)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            self._reply(json.loads(self.rfile.read(n) or b"{}"))
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_address[1]}", srv
+
+
+def _sse(*chunks):
+    return ("text/event-stream",
+            "".join(f"data: {json.dumps(c)}\n\n" for c in chunks).encode() + b"data: [DONE]\n\n")
+
+
+def test_year_goes_into_search_tool_and_queries():
+    """qwen3.5:9b searched 'who won the Masters this year 2024' in 2026."""
+    import time as t
+
+    m = _load_chat()
+    desc = m.tools_for(t.strptime("2026-09-29", "%Y-%m-%d"))[0]["function"]["description"]
+    assert "It is 2026" in desc and "{year}" not in desc
+    assert "{year}" in m.TOOLS[0]["function"]["description"]   # template untouched
+    assert m.search_query_for("Who won the Masters this year?", 2026) == \
+        "Who won the Masters this year? 2026"
+    assert m.search_query_for("Who won the 2025  Masters?", 2026) == "Who won the 2025 Masters?"
+
+
+def test_routing_patterns():
+    m = _load_chat()
+    for q in ["Who won the World Cup this year?", "Who is the chair of the Federal Reserve?",
+              "what's the latest on the storm", "price of bitcoin"]:
+        assert m.CURRENT_WORDS.search(q), q
+    for q in ["What is 17 times 3?", "Tell me a joke", "How does a heat pump work?"]:
+        assert not m.CURRENT_WORDS.search(q), q
+    for q in ["How is the reservoir doing?", "what's the humidity in the tent", "EC check"]:
+        assert m.GROW_WORDS.search(q), q
+    assert not m.GROW_WORDS.search("What is 17 times 3?")
+
+
+def test_web_search_formats_and_reports_outages():
+    m = _load_chat()
+    state = {"mode": "ok"}
+
+    def handler(path, _body):
+        if state["mode"] == "ok":
+            d = {"answers": [{"answer": "Spain"}],
+                 "infoboxes": [{"infobox": "2026 FIFA World Cup", "content": "Held in NA."}],
+                 "results": [{"title": f"T{i}", "url": f"https://x/{i}", "content": "snip " * 3}
+                             for i in range(10)]}
+        else:
+            d = {"results": [], "unresponsive_engines": [["brave", "Suspended: too many requests"]]}
+        return "application/json", json.dumps(d).encode()
+
+    base, srv = _post_stub(handler)
+    try:
+        m.SEARX_URL = base
+        out = m.web_search("world cup 2026")
+        assert out.splitlines()[0] == "Answer: Spain"
+        assert "Infobox (2026 FIFA World Cup)" in out
+        assert "8. T7 - https://x/7" in out and "T8" not in out
+        state["mode"] = "down"
+        out = m.web_search("anything")
+        assert out.startswith("SEARCH UNAVAILABLE") and "brave: Suspended" in out
+    finally:
+        srv.shutdown()
+
+
+def test_stream_reply_collects_tool_calls_both_shapes():
+    m = _load_chat()
+    whole = _sse({"choices": [{"delta": {"content": "", "tool_calls": [
+        {"id": "c1", "index": 0, "type": "function",
+         "function": {"name": "web_search", "arguments": '{"query":"q"}'}}]}}]},
+        {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+    fragments = _sse(
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c2",
+                                                "function": {"name": "grow_status", "arguments": ""}}]}}]},
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}}]})
+    for body, want in ((whole, ("c1", "web_search", '{"query":"q"}')),
+                       (fragments, ("c2", "grow_status", "{}"))):
+        base, srv = _post_stub(lambda p, b, body=body: body)
+        try:
+            m.LLM_URL = base
+            calls = []
+            reply, _, _ = m.stream_reply("m", [], "ollama", tools=m.TOOLS, calls_out=calls)
+            assert reply == ""
+            assert (calls[0]["id"], calls[0]["name"], calls[0]["arguments"]) == want
+        finally:
+            srv.shutdown()
+
+
+def test_chat_turn_runs_a_tool_round():
+    """Model asks for a search, gets the result, then answers from it."""
+    m = _load_chat()
+    seen = []
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            return "application/json", json.dumps(
+                {"results": [{"title": "Golden Tempo wins", "url": "https://w", "content": "Derby"}]}).encode()
+        seen.append(body)
+        if len(seen) == 1:
+            return _sse({"choices": [{"delta": {"tool_calls": [
+                {"id": "c1", "index": 0, "function": {"name": "web_search",
+                                                      "arguments": '{"query":"derby 2026"}'}}]}}]})
+        return _sse({"choices": [{"delta": {"content": "Golden Tempo won."}}]})
+
+    base, srv = _post_stub(handler)
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        hist = [{"role": "system", "content": "s"}]
+        # No current-events words here, so no auto-search: this exercises the
+        # model-driven tool round.
+        reply, _, used, grow = m.chat_turn("m", hist, "Tell me about the derby horse",
+                                           "ollama", True, log=lambda *a: None)
+        assert reply == "Golden Tempo won."
+        assert used == [{"name": "web_search", "args": {"query": "derby 2026"}}]
+        assert [h["role"] for h in hist] == ["system", "user", "assistant", "tool"]
+        assert "Golden Tempo wins" in hist[-1]["content"]
+        assert "tools" in seen[0] and "It is " in seen[0]["tools"][0]["function"]["description"]
+        assert grow is False
+    finally:
+        srv.shutdown()
+
+
+def test_chat_turn_searches_current_questions_itself():
+    """Left to decide, the model answered 'Jerome Powell' 3/3 without searching."""
+    import time as t
+    import urllib.parse as up
+
+    m = _load_chat()
+    queries = []
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            queries.append(up.parse_qs(up.urlsplit(path).query)["q"][0])
+            return "application/json", json.dumps(
+                {"results": [{"title": "Warsh sworn in", "url": "https://f", "content": "chair"}]}).encode()
+        return _sse({"choices": [{"delta": {"content": "Kevin Warsh."}}]})
+
+    base, srv = _post_stub(handler)
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        hist = [{"role": "system", "content": "s"}]
+        reply, _, used, _ = m.chat_turn("m", hist, "Who is the chair of the Federal Reserve?",
+                                        "ollama", True, log=lambda *a: None)
+        assert len(queries) == 1 and queries[0].endswith(str(t.localtime().tm_year))
+        assert used[0]["auto"] is True
+        assert "Warsh sworn in" in hist[1]["content"]
+    finally:
+        srv.shutdown()
+
+
+def test_grow_status_reads_cached_bar_json(tmp_path):
+    """The bar JSON has raw newlines inside strings; strict=False must take it."""
+    m = _load_chat()
+    for cmd in ("acinf", "vivosun", "yinmik"):
+        f = tmp_path / cmd
+        f.write_text("#!/bin/sh\nprintf '{\"text\": \"t\", \"tooltip\": \"%s:\\n  line2\"}\\n'\n" % cmd)
+        f.chmod(0o755)
+    old = os.environ["PATH"]
+    os.environ["PATH"] = f"{tmp_path}:{old}"
+    try:
+        out = m.grow_status()
+    finally:
+        os.environ["PATH"] = old
+    assert out.splitlines() == ["acinf:", "  line2", "vivosun:", "  line2", "yinmik:", "  line2"]
+
+
+def test_resume_picks_latest_chat_session_and_skips_the_rest(tmp_path):
+    import time as t
+
+    m = _load_chat()
+    chat = tmp_path / "a.jsonl"
+    chat.write_text("\n".join(json.dumps(r) for r in [
+        {"via": "text", "user": "hi", "assistant": "hello"},
+        {"via": "voice-discarded", "user": "Thank you.", "assistant": None, "sent": False},
+        {"via": "vad-discarded", "user": None, "assistant": None, "sent": False},
+        {"via": "voice", "user": "17x3?", "assistant": "51"}]) + "\n")
+    t.sleep(0.01)
+    agent = tmp_path / "b.jsonl"   # newer, but an agent session
+    agent.write_text(json.dumps({"user": "fix", "assistant": "done", "session_id": "s"}) + "\n")
+    assert m.latest_chat_log(str(tmp_path)) == str(chat)
+    assert m.history_from_log(str(chat)) == [
+        {"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "17x3?"}, {"role": "assistant", "content": "51"}]
+    assert m.latest_chat_log(str(tmp_path / "empty")) is None
