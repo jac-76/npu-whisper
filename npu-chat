@@ -119,6 +119,23 @@ TOOLS = [
                        "(temperature, humidity, light and fan levels) and the YINMIK "
                        "reservoir meter (pH, EC, ppm, water temperature). Read-only.",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "grow_control",
+        "description": "Change one grow output. npu-chat asks the user to confirm "
+                       "before anything changes, so call it directly. device "
+                       "'vivosun' (VIVOSUN GrowHub): target 'light' (value 0 = off, "
+                       "or 25-100 percent), 'duct' (exhaust fan, 0-10) or 'circ' "
+                       "(circulation fan, 0-10 or 'natural'). device 'acinfinity' "
+                       "(AC Infinity controller): target a port number 1-4, value a "
+                       "fan speed 0-10 or a mode: on, off, auto, vpd, cycle, schedule.",
+        "parameters": {"type": "object",
+                       "properties": {
+                           "device": {"type": "string", "enum": ["vivosun", "acinfinity"]},
+                           "target": {"type": "string",
+                                      "description": "light, duct, circ, or port 1-4"},
+                           "value": {"type": "string",
+                                     "description": "level, speed or mode"}},
+                       "required": ["device", "target", "value"]}}},
 ]
 
 def tools_for(today: time.struct_time | None = None) -> list[dict]:
@@ -143,12 +160,18 @@ TOOLS_HINT = (
 )
 
 
-def web_search(query: str, n: int = 8) -> str:
+def web_search(query: str, n: int = 8, found: list | None = None) -> str:
+    """Formatted results for the model; the raw top-n go into `found` too,
+    so the reply can be attributed to one of them afterwards."""
     url = f"{SEARX_URL}/search?" + urllib.parse.urlencode({"q": query, "format": "json"})
     try:
         d = json.loads(urllib.request.urlopen(url, timeout=15).read())
     except Exception as exc:
         return f"web search failed: {exc}"
+    if found is not None:
+        found.extend({"title": r.get("title") or "", "url": r.get("url") or "",
+                      "content": r.get("content") or ""}
+                     for r in (d.get("results") or [])[:n])
     results = d.get("results") or []
     lines = []
     # SearXNG's direct answers and infoboxes, when an engine gives one, are the
@@ -220,19 +243,268 @@ CURRENT_WORDS = re.compile(
     r"next (game|match|race|election))\b", re.I)
 
 
+_CITE_STOP = {"the", "and", "for", "with", "that", "this", "from", "was", "were",
+              "are", "has", "have", "won", "who", "what", "which", "their", "they",
+              "most", "recent", "year", "season", "according", "source", "yes", "its"}
+
+
+def _evidence(text: str) -> set[str]:
+    """The specific bits of a reply a supporting result must also contain:
+    names (capitalised words) and numbers, e.g. {'seahawks', 'patriots', '29'}."""
+    words = re.findall(r"[A-Za-z][A-Za-z'\-]+|\d+(?:\.\d+)?", text)
+    out = set()
+    for i, w in enumerate(words):
+        lw = w.lower().strip("'-")
+        if lw in _CITE_STOP or len(lw) < 2:
+            continue
+        if w[0].isdigit() or (w[0].isupper() and len(w) >= 3):
+            out.add(lw)
+    return out
+
+
+_MONTHS = ("january", "february", "march", "april", "may", "june", "july",
+           "august", "september", "october", "november", "december")
+
+
+def _evidence_pattern(e: str) -> re.Pattern:
+    """How one piece of evidence may appear in a snippet: '5' as '05',
+    'September' as 'Sep.' - the forms results actually use."""
+    if e.isdigit():
+        return re.compile(r"(?<!\d)0*" + str(int(e)) + r"(?!\d)")
+    if e in _MONTHS:
+        return re.compile(r"(?<![\w])" + e[:3] + r"(?:" + e[3:] + r"|\.)?(?![\w])")
+    return re.compile(r"(?<![\w])" + re.escape(e) + r"(?![\w])")
+
+
+def site_name(url: str, title: str = "") -> str:
+    """'… - Wikipedia' -> Wikipedia; fifa.com -> FIFA; espn.com -> ESPN."""
+    m = re.search(r"\s[-|–—]\s([^-|–—]{2,30})$", title or "")
+    if m and len(m.group(1).split()) <= 3:
+        return m.group(1).strip()
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    parts = [p for p in host.split(".") if p not in ("www", "en", "m", "amp")]
+    label = parts[-2] if len(parts) >= 2 else (parts[0] if parts else url)
+    if len(label) <= 4:
+        return label.upper()
+    return "-".join(p.capitalize() for p in label.split("-"))
+
+
+def attribute(reply: str, found: list[dict], question: str = "") -> dict | None:
+    """The search result that best supports the reply, or None.
+
+    A result supports it when it shares the reply's names and numbers - the
+    ones not already in the question (every result about "Ohio State" says
+    "Ohio State"; only the one naming the opponent supports "Indiana").
+    None after a search means the answer is in none of the results - the case
+    where a model had invented "Chiefs 61-9, reported by ESPN".
+    """
+    asked = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'\-]+|\d+", question)}
+    asked.add(str(time.localtime().tm_year))
+    ev = _evidence(reply) - asked
+    pats = [_evidence_pattern(e) for e in ev]
+    best, best_score = None, 0
+    for r in found:
+        hay = f"{r['title']} {r['content']}".lower()
+        score = sum(1 for p in pats if p.search(hay))
+        if score > best_score:
+            best, best_score = r, score
+    if best is None or best_score < min(2, len(ev)) or not ev:
+        return None
+    return {**best, "site": site_name(best["url"], best["title"]), "score": best_score}
+
+
 def search_query_for(text: str, year: int) -> str:
     """The user's own words as the query, with the year added if missing."""
     q = " ".join(text.split())
     return q if re.search(r"\b(19|20)\d\d\b", q) else f"{q} {year}"
 
 
-def with_search_context(text: str, year: int) -> tuple[str, str | None]:
-    if not CURRENT_WORDS.search(text):
-        return text, None
-    q = search_query_for(text, year)
-    return (f"{text}\n\n[Web results for '{q}', fetched just now. They are newer "
+def with_search_context(user_text: str, content: str, year: int,
+                        found: list | None = None) -> tuple[str, str | None]:
+    """Append web results to `content` when the user's own words ask about the
+    present. Only `user_text` is matched and sent to the search engines:
+    matching `content` once sent the attached grow readings ("...they are
+    current") out as a web query."""
+    if not CURRENT_WORDS.search(user_text):
+        return content, None
+    q = search_query_for(user_text, year)
+    return (f"{content}\n\n[Web results for '{q}', fetched just now. They are newer "
             f"than your training; answer from them and name the site]\n"
-            f"{web_search(q)}"), q
+            f"{web_search(q, found=found)}"), q
+
+
+# --- grow control: validated here, confirmed by the user, then run ----------
+# Both CLIs change modes as a side effect, and the confirmation says so:
+# `acinf set` forces the port to manual "on" (0 = off), which ends a
+# schedule; `vivosun set` puts that output in manual mode.
+ACINF_MODES = ("on", "off", "auto", "vpd", "cycle", "schedule")
+VIVO_NAMES = {"light": "light", "duct": "duct fan", "circ": "circulation fan"}
+
+
+def _cached_tooltip(cmd: str) -> str:
+    try:
+        r = subprocess.run([cmd, "bar"], capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout.strip(), strict=False).get("tooltip") or ""
+    except Exception:
+        return ""
+
+
+def plan_control(device: str, target: str, value: str,
+                 acinf_tip: str | None = None, vivo_tip: str | None = None
+                 ) -> tuple[list[str], str]:
+    """Validate a control request. Returns (argv, the question to confirm).
+
+    Raises ValueError with a reason for anything outside the allowed set -
+    the model's arguments are never trusted as they come.
+    """
+    device = (device or "").strip().lower()
+    target = (target or "").strip().lower()
+    value = (value or "").strip().lower()
+    if device == "vivosun":
+        if target not in VIVO_NAMES:
+            raise ValueError(f"vivosun target must be light, duct or circ, not {target!r}")
+        if target == "circ" and value == "natural":
+            level, shown = "natural", "natural wind"
+        else:
+            try:
+                level = int(float(value.rstrip("%")))
+            except ValueError:
+                raise ValueError(f"{target} needs a number, not {value!r}") from None
+            if target == "light" and not (level == 0 or 25 <= level <= 100):
+                raise ValueError("light must be 0 (off) or 25-100 percent")
+            if target in ("duct", "circ") and not 0 <= level <= 10:
+                raise ValueError(f"{target} must be 0-10")
+            shown = (f"{level} percent" if target == "light" and level else
+                     "off" if level == 0 else f"{level} out of 10")
+        tip = vivo_tip if vivo_tip is not None else _cached_tooltip("vivosun")
+        pat = {"light": r"light (\S+)", "duct": r"duct fan (\S+)",
+               "circ": r"circ fan (\S+)"}[target]
+        now = re.search(pat, tip)
+        now_txt = f" It is at {now.group(1)} now." if now else ""
+        return (["vivosun", "set", target, str(level)],
+                f"Set the {VIVO_NAMES[target]} to {shown}?{now_txt} "
+                f"This puts it in manual mode.")
+    if device == "acinfinity":
+        m = re.fullmatch(r"(?:port\s*)?([1-4])", target)
+        if not m:
+            raise ValueError(f"acinfinity target must be a port 1-4, not {target!r}")
+        port = m.group(1)
+        tip = acinf_tip if acinf_tip is not None else _cached_tooltip("acinf")
+        cur = re.search(rf"Port {port}: (\S+) @ (\d+)/10", tip)
+        cur_mode = cur.group(1) if cur else None
+        now_txt = (f" It is in {cur.group(1)} mode at {cur.group(2)} out of 10 now."
+                   if cur else "")
+        if value in ACINF_MODES:
+            return (["acinf", "mode", port, value],
+                    f"Switch AC Infinity port {port} to {value} mode?{now_txt}")
+        try:
+            speed = int(float(value))
+        except ValueError:
+            raise ValueError(f"port {port} needs a speed 0-10 or one of "
+                             f"{', '.join(ACINF_MODES)}, not {value!r}") from None
+        if not 0 <= speed <= 10:
+            raise ValueError("fan speed must be 0-10")
+        what = "turn it off" if speed == 0 else f"set it to {speed} out of 10"
+        warn = ""
+        if cur_mode and cur_mode not in ("on", "off"):
+            warn = f" That ends its {cur_mode} mode and makes it manual."
+        return (["acinf", "set", port, str(speed)],
+                f"AC Infinity port {port}: {what}?{now_txt}{warn}")
+    raise ValueError(f"device must be vivosun or acinfinity, not {device!r}")
+
+
+# Spoken control requests are parsed here, not left to the model: offered the
+# grow_control tool, qwen3.5:9b called it for 2 of 12 requests (3 of 12 with
+# tool_choice forcing it - ollama does not enforce that), never for the light
+# or duct fan, and once said "I'll increase your circulation fan to 5 right
+# now" without calling anything. The vocabulary is small enough to parse.
+_CONTROL_VERB = re.compile(r"\b(turn|set|switch|put|raise|lower|increase|decrease|"
+                           r"bump|dim|crank|change|make)\b", re.I)
+_CONTROL_TARGETS = [
+    (re.compile(r"\b(circ(ulation)?|oscillating|clip)\s*fan\b|\bcirc\b", re.I), ("vivosun", "circ")),
+    (re.compile(r"\b(duct|exhaust|inline)\s*fan\b|\bduct\b", re.I), ("vivosun", "duct")),
+    (re.compile(r"\b(grow\s*)?lights?\b|\blamp\b", re.I), ("vivosun", "light")),
+    (re.compile(r"\bport\s*(one|two|three|four|[1-4])\b", re.I), ("acinfinity", None)),
+]
+_NUMBER_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+                 "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def parse_control(text: str) -> tuple[str, str, str] | None:
+    """(device, target, value) for a spoken control request, or None.
+
+    Only a request naming exactly one output and one value parses; anything
+    ambiguous returns None and is left to the model plus the confirmation.
+    """
+    if not _CONTROL_VERB.search(text):
+        return None
+    hits = []
+    for pat, (device, target) in _CONTROL_TARGETS:
+        m = pat.search(text)
+        if m:
+            if device == "acinfinity":
+                word = m.group(1).lower()
+                target = str(_NUMBER_WORDS.get(word, word))
+            hits.append((device, target, m))
+    if len(hits) != 1:
+        return None
+    device, target, m = hits[0]
+    rest = (text[:m.start()] + " " + text[m.end():]).lower()
+    if re.search(r"\bby\b", rest):
+        return None      # "up by 2" is relative; never read it as "to 2"
+    for word, n in _NUMBER_WORDS.items():
+        rest = re.sub(rf"\b{word}\b", str(n), rest)
+    modes = [w for w in ACINF_MODES if re.search(rf"\b{w}\b", rest)]
+    num = re.findall(r"\b(\d{1,3})\s*(?:%|percent|out of 10)?", rest)
+    if device == "vivosun" and target == "circ" and re.search(r"\bnatural\b", rest):
+        return device, target, "natural"
+    if re.search(r"\boff\b", rest) and not num:
+        return device, target, "0" if device == "vivosun" else "off"
+    if device == "acinfinity" and modes and not num:
+        return (device, target, modes[0]) if len(modes) == 1 else None
+    if len(num) == 1:
+        return device, target, num[0]
+    return None
+
+
+_CONTROL_NOUN = re.compile(r"\b(fans?|lights?|lamps?|ports?|pumps?|heaters?|"
+                           r"humidifiers?|dehumidifiers?)\b", re.I)
+
+
+def control_intent(text: str) -> bool:
+    """A request to change a grow output, parsed or not - "turn up the fans"
+    counts even though it names no particular fan."""
+    return bool(_CONTROL_VERB.search(text)) and bool(_CONTROL_NOUN.search(text))
+
+
+def handle_control(parsed: tuple[str, str, str], confirm) -> tuple[str, dict]:
+    """Validate, confirm and run a parsed control request. Returns the reply
+    and a log entry. The reply is built from what actually happened."""
+    device, target, value = parsed
+    entry = {"name": "grow_control", "parsed": True,
+             "args": {"device": device, "target": target, "value": value}}
+    try:
+        argv, question = plan_control(device, target, value)
+    except ValueError as exc:
+        entry["result"] = f"not allowed: {exc}"
+        return f"I can't do that: {exc}. Nothing was changed.", entry
+    if not confirm(question):
+        entry["result"] = "cancelled"
+        return "Cancelled. Nothing was changed.", entry
+    result = run_control(argv)
+    entry["result"] = result
+    if result.startswith("done"):
+        return f"Done. {result[len('done: '):]}.", entry
+    return f"That did not work: {result}. It may not have changed.", entry
+
+
+def run_control(argv: list[str]) -> str:
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=45)
+    except Exception as exc:
+        return f"failed: {exc}"
+    out = " ".join((r.stdout or r.stderr).split())[:300]
+    return f"done: {out}" if r.returncode == 0 else f"failed (exit {r.returncode}): {out}"
 
 
 def describe_call(name: str, args: dict) -> str:
@@ -240,10 +512,16 @@ def describe_call(name: str, args: dict) -> str:
         return f"searching: {args.get('query', '')}"
     if name == "grow_status":
         return "reading grow status"
+    if name == "grow_control":
+        return (f"grow control: {args.get('device', '?')} {args.get('target', '?')} "
+                f"-> {args.get('value', '?')}")
     return f"{name} {json.dumps(args)}"
 
 
-def run_tool(name: str, raw_args: str) -> tuple[dict, str]:
+def run_tool(name: str, raw_args: str, found: list | None = None,
+             confirm=None) -> tuple[dict, str]:
+    """Run one tool call. grow_control changes real hardware, so it runs only
+    when `confirm(question)` returns True; with no confirm it never runs."""
     try:
         args = json.loads(raw_args or "{}")
         if not isinstance(args, dict):
@@ -252,9 +530,19 @@ def run_tool(name: str, raw_args: str) -> tuple[dict, str]:
         return {}, f"could not parse arguments: {raw_args!r}"
     if name == "web_search":
         q = str(args.get("query") or "").strip()
-        return args, web_search(q) if q else "empty query"
+        return args, web_search(q, found=found) if q else "empty query"
     if name == "grow_status":
         return args, grow_status()
+    if name == "grow_control":
+        try:
+            argv, question = plan_control(str(args.get("device", "")),
+                                          str(args.get("target", "")),
+                                          str(args.get("value", "")))
+        except ValueError as exc:
+            return args, f"not allowed: {exc}. Nothing was changed."
+        if confirm is None or not confirm(question):
+            return args, "The user cancelled. Nothing was changed."
+        return args, run_control(argv)
     return args, f"unknown tool {name}"
 
 
@@ -295,12 +583,24 @@ def history_from_log(path: str) -> list[dict]:
 
 def chat_turn(model: str, history: list[dict], user_text: str,
               server: str | None, tools_on: bool, on_delta=None,
-              log=print) -> tuple[str, float | None, list[dict], bool]:
+              log=print, found: list | None = None, confirm=None
+              ) -> tuple[str, float | None, list[dict], bool]:
     """One user turn, tool calls included. Mutates `history`.
 
     Returns (reply, time to first text, tools used, grow readings attached).
+    Every search result seen this turn is appended to `found`, for attribution.
     On an empty reply the caller rolls history back.
     """
+    if tools_on and confirm is not None:
+        parsed = parse_control(user_text)
+        if parsed:
+            log(f"{DIM}· grow control: {' '.join(parsed)}{RESET}")
+            reply, entry = handle_control(parsed, confirm)
+            history.append({"role": "user", "content": user_text})
+            print(f"{GREEN}{BOLD}npu{RESET} {reply}")
+            if on_delta:
+                on_delta(reply + " ")
+            return reply, 0.0, [entry], False
     content, grow_attached = (with_grow_context(user_text) if tools_on
                               else (user_text, False))
     if grow_attached:
@@ -312,7 +612,7 @@ def chat_turn(model: str, history: list[dict], user_text: str,
             log(f"{DIM}· searching: {search_query_for(user_text, year)}{RESET}")
             if on_delta:
                 on_delta("Let me check. ")
-        content, q = with_search_context(content, year)
+        content, q = with_search_context(user_text, content, year, found=found)
         if q:
             used.append({"name": "web_search", "args": {"query": q}, "auto": True})
     history.append({"role": "user", "content": content})
@@ -329,7 +629,7 @@ def chat_turn(model: str, history: list[dict], user_text: str,
             ttft = (t_round - t_turn) + r_ttft
         if not calls:
             break
-        if on_delta and not used:
+        if on_delta and not used and any(c["name"] != "grow_control" for c in calls):
             on_delta("Let me check. ")    # something to hear while it looks
         history.append({"role": "assistant", "content": reply or "",
                         "tool_calls": [
@@ -343,8 +643,13 @@ def chat_turn(model: str, history: list[dict], user_text: str,
             except json.JSONDecodeError:
                 preview = {}
             log(f"{DIM}· {describe_call(c['name'], preview if isinstance(preview, dict) else {})}{RESET}")
-            args_used, result = run_tool(c["name"], c["arguments"])
-            used.append({"name": c["name"], "args": args_used})
+            args_used, result = run_tool(c["name"], c["arguments"], found=found,
+                                         confirm=confirm)
+            entry = {"name": c["name"], "args": args_used}
+            if c["name"] == "grow_control":
+                entry["result"] = result
+                log(f"{DIM}  {result}{RESET}")
+            used.append(entry)
             history.append({"role": "tool",
                             "tool_call_id": c["id"] or f"call_{round_}_{i}",
                             "content": result})
@@ -1764,6 +2069,22 @@ def main() -> int:
 
     speaker = Speaker(voice_path) if voice_path and tts_ready() else None
 
+    def confirm_action(question: str) -> bool:
+        """Grow control changes real hardware: say it, show it, wait for Enter.
+        Only Enter / y / yes goes ahead; anything else, or no input, cancels."""
+        print(f"\n{YELLOW}{BOLD}? {question}{RESET}")
+        if speaking and speaker:
+            speaker.say(question + " Press Enter to do it, or x to cancel.")
+        try:
+            ans = input(f"{DIM}Enter do it · x cancel{RESET} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "x"
+        if speaker:
+            speaker.stop()
+        ok = ans in ("", "y", "yes")
+        print(f"{DIM}{'confirmed' if ok else 'cancelled'}.{RESET}")
+        return ok
+
     while True:
         try:
             line = input(f"{CYAN}{BOLD}you{RESET} ").strip()
@@ -1871,11 +2192,37 @@ def main() -> int:
         if voiced:
             speaker.begin()
         t_turn = time.time()
+        found: list[dict] = []
         reply, ttft, used, grow_attached = chat_turn(
             model, history, user_text, llm_server, tools_on,
-            on_delta=speaker.feed if voiced else None)
+            on_delta=speaker.feed if voiced else None, found=found,
+            confirm=confirm_action)
         total = time.time() - t_turn
+        if (tools_on and reply and control_intent(user_text)
+                and not any(u["name"] == "grow_control" for u in used)):
+            # The model has claimed "I'll set it to 5 right now" without doing
+            # anything. Whatever it said, say what actually happened.
+            print(f"{YELLOW}! nothing was changed - say it as "
+                  f"'set the circulation fan to 5'{RESET}")
+            if voiced:
+                speaker.feed(" Nothing was changed. ")
         first_audio = None
+        source = None
+        searched = any(u["name"] == "web_search" for u in used)
+        if reply and searched and found:
+            # Say where it came from, checked against the results rather than
+            # left to the model; flag answers that are in none of them.
+            source = attribute(reply, found, user_text)
+            if source is None:
+                print(f"{YELLOW}! that answer is not in the search results - "
+                      f"treat it with care{RESET}")
+                if voiced:
+                    speaker.feed(" I could not find that in the search results, "
+                                 "so treat it with care. ")
+            else:
+                print(f"{DIM}source: {source['site']} - {source['url']}{RESET}")
+                if voiced and source["site"].lower() not in reply.lower():
+                    speaker.feed(f" Source: {source['site']}. ")
         if reply:
             history.append({"role": "assistant", "content": reply})
             if voiced:
@@ -1892,6 +2239,9 @@ def main() -> int:
                             total_secs=round(total, 3),
                             tools=used or None,
                             grow_attached=grow_attached or None,
+                            source=(source or {}).get("url") if searched else None,
+                            unsourced=(bool(reply) and searched and bool(found)
+                                       and source is None) or None,
                             first_audio_secs=round(first_audio, 3) if first_audio else None,
                             vad_max_p=LAST_CAPTURE.get("vad_max_p") if audio_secs else None)
         print()

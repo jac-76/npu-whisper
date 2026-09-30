@@ -886,3 +886,187 @@ def test_npu_vad_reports_unavailable_without_model(tmp_path):
 def test_dictate_uses_the_speech_check():
     src = open("npu-dictate").read()
     assert "npu-vad" in src and "no speech detected" in src
+
+
+# --- spoken sources ---------------------------------------------------------------
+
+def test_site_names():
+    m = _load_chat()
+    assert m.site_name("https://en.wikipedia.org/wiki/X", "2026 NBA Finals - Wikipedia") == "Wikipedia"
+    assert m.site_name("https://www.fifa.com/a", "World Cup 2026: standings") == "FIFA"
+    assert m.site_name("https://www.espn.com/x", "NFL History") == "ESPN"
+    assert m.site_name("https://www.basketball-reference.com/p",
+                       "Finals | Basketball-Reference.com") == "Basketball-Reference"
+
+
+def test_attribution_finds_support_and_flags_inventions():
+    """The fabricated 'Chiefs 61-9, reported by ESPN' matched none of the results."""
+    m = _load_chat()
+    found = [
+        {"title": "Super Bowl winners", "url": "https://betnow.eu/x",
+         "content": "The most recent trophy belongs to Seattle, a 29-13 job on New England."},
+        {"title": "Seahawks beat Patriots", "url": "https://profootballmania.com/x",
+         "content": "The Seattle Seahawks beat the New England Patriots 29-13 in Super Bowl LX."}]
+    src = m.attribute("The Seattle Seahawks won Super Bowl LX, beating the Patriots 29-13.", found)
+    assert src["url"] == "https://profootballmania.com/x" and src["site"] == "Profootballmania"
+    assert m.attribute("The Kansas City Chiefs beat the San Francisco 49ers 61-9, "
+                       "as reported by ESPN.", found) is None
+    assert m.attribute("", found) is None
+
+
+# --- grow control: validated, confirmed, then run ----------------------------------
+
+_ACINF = "Infinity 69 Pro: 74F\n  1. Port 1: on @ 3/10\n  4. Port 4: schedule @ 7/10  (2h left)"
+_VIVO = "GrowHub E42A: 68F\n  light 100% · duct fan 3/10 · circ fan 3/10"
+
+
+def test_plan_control_validates_and_states_mode_changes():
+    import pytest
+
+    m = _load_chat()
+    argv, q = m.plan_control("vivosun", "circ", "5", _ACINF, _VIVO)
+    assert argv == ["vivosun", "set", "circ", "5"]
+    assert "3/10 now" in q and "manual mode" in q
+    argv, q = m.plan_control("acinfinity", "port 4", "6", _ACINF, _VIVO)
+    assert argv == ["acinf", "set", "4", "6"]
+    assert "schedule mode" in q and "ends its schedule mode" in q
+    argv, q = m.plan_control("acinfinity", "1", "0", _ACINF, _VIVO)
+    assert argv == ["acinf", "set", "1", "0"] and "turn it off" in q and "ends" not in q
+    assert m.plan_control("acinfinity", "4", "schedule", _ACINF, _VIVO)[0] == \
+        ["acinf", "mode", "4", "schedule"]
+    assert m.plan_control("vivosun", "light", "0", _ACINF, _VIVO)[0][-1] == "0"
+    for bad in [("vivosun", "light", "20"), ("vivosun", "duct", "11"), ("vivosun", "pump", "1"),
+                ("acinfinity", "7", "3"), ("acinfinity", "2", "turbo"), ("nest", "x", "1"),
+                ("vivosun", "circ", "5; rm -rf ~")]:
+        with pytest.raises(ValueError):
+            m.plan_control(*bad, acinf_tip=_ACINF, vivo_tip=_VIVO)
+
+
+def test_grow_control_never_runs_without_a_yes(tmp_path):
+    m = _load_chat()
+    log = tmp_path / "ran.txt"
+    for cmd in ("vivosun", "acinf"):
+        f = tmp_path / cmd
+        f.write_text(f'#!/bin/sh\nif [ "$1" = bar ]; then echo \'{{"tooltip": ""}}\'; exit 0; fi\n'
+                     f'echo "{cmd} $*" >> {log}\necho "circ fan -> 5/10 confirmed"\n')
+        f.chmod(0o755)
+    old = os.environ["PATH"]
+    os.environ["PATH"] = f"{tmp_path}:{old}"
+    try:
+        raw = '{"device": "vivosun", "target": "circ", "value": "5"}'
+        asked = []
+        assert "cancelled" in m.run_tool("grow_control", raw)[1]              # no confirm at all
+        assert "cancelled" in m.run_tool("grow_control", raw,
+                                         confirm=lambda q: asked.append(q) or False)[1]
+        assert not log.exists(), "nothing may run before a yes"
+        assert asked and asked[0].startswith("Set the circulation fan to 5")
+        assert "not allowed" in m.run_tool(
+            "grow_control", '{"device": "vivosun", "target": "light", "value": "5"}',
+            confirm=lambda q: True)[1]
+        assert not log.exists()
+        out = m.run_tool("grow_control", raw, confirm=lambda q: True)[1]
+        assert out == "done: circ fan -> 5/10 confirmed"
+        assert log.read_text().strip() == "vivosun set circ 5"
+    finally:
+        os.environ["PATH"] = old
+
+
+def test_attribution_ignores_words_from_the_question():
+    """Every result about Ohio State says 'Ohio State'; that is not evidence of
+    the opponent. The wrong 'Indiana' must not be credited to a source."""
+    m = _load_chat()
+    q = "Who did Ohio State play in their first football game this season?"
+    found = [{"title": "Ohio State Buckeyes 2026 schedule", "url": "https://espn.com/x",
+              "content": "Ohio State football first game of the 2026 season at Ohio Stadium."},
+             {"title": "2026 Football Schedule - Ohio State", "url": "https://ohiostatebuckeyes.com/s",
+              "content": "Sep. 05 vs Ball State. Columbus, Ohio; Sep. 12 at Texas."}]
+    assert m.attribute("Ohio State played Indiana in their first game.", found, q) is None
+    src = m.attribute("Ohio State opened against Ball State on September 5.", found, q)
+    assert src and src["url"] == "https://ohiostatebuckeyes.com/s"
+
+
+def test_grow_readings_never_reach_the_search_engines():
+    """Regression: routing matched the attached readings ("...they are
+    current") and sent the user's sentence plus all grow readings out as a
+    public web query. Only the user's own words may be matched or sent."""
+    m = _load_chat()
+    queries = []
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            queries.append(path)
+            return "application/json", b'{"results": []}'
+        return _sse({"choices": [{"delta": {"content": "Fans are at 3/10."}}]})
+
+    base, srv = _post_stub(handler)
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        m.grow_status = lambda: "circ fan 3/10, pH 5.79 - current readings, right now"
+        hist = [{"role": "system", "content": "s"}]
+        m.chat_turn("m", hist, "Turn the circulation fan up to 5.", "ollama", True,
+                    log=lambda *a: None)
+        assert queries == []
+        assert "pH 5.79" in hist[1]["content"]          # readings still reach the model
+    finally:
+        srv.shutdown()
+
+
+def test_parse_control_phrasings():
+    m = _load_chat()
+    cases = {
+        "Turn the circulation fan up to 5.": ("vivosun", "circ", "5"),
+        "Set AC Infinity port 4 to 6.": ("acinfinity", "4", "6"),
+        "Turn the grow light off.": ("vivosun", "light", "0"),
+        "Put the duct fan on 4.": ("vivosun", "duct", "4"),
+        "Set the light to 50 percent": ("vivosun", "light", "50"),
+        "turn port two off": ("acinfinity", "2", "off"),
+        "switch port 4 to schedule": ("acinfinity", "4", "schedule"),
+        "set the circ fan to natural": ("vivosun", "circ", "natural"),
+        "turn the circ fan to five": ("vivosun", "circ", "5"),
+    }
+    for text, want in cases.items():
+        assert m.parse_control(text) == want, text
+    for text in ["What is the duct fan at?", "turn up the fans", "Turn off the TV",
+                 "set the light and the duct fan to 4", "turn the circ fan up by 2"]:
+        assert m.parse_control(text) is None, text
+    assert m.control_intent("turn up the fans") and not m.control_intent("what is the pH")
+
+
+def test_parsed_control_skips_the_model_and_reports_what_happened(tmp_path):
+    """The model once said 'I'll increase your circulation fan to 5 right now'
+    and called nothing. A parsed request never goes to the model."""
+    m = _load_chat()
+    llm_calls = []
+
+    def handler(path, body):
+        llm_calls.append(path)
+        return _sse({"choices": [{"delta": {"content": "I'll do that right now."}}]})
+
+    base, srv = _post_stub(handler)
+    log = tmp_path / "ran.txt"
+    f = tmp_path / "vivosun"
+    f.write_text(f'#!/bin/sh\nif [ "$1" = bar ]; then echo \'{{"tooltip": "circ fan 3/10"}}\'; exit 0; fi\n'
+                 f'echo "$*" >> {log}\necho "circ fan -> 5/10 confirmed"\n')
+    f.chmod(0o755)
+    old = os.environ["PATH"]
+    os.environ["PATH"] = f"{tmp_path}:{old}"
+    try:
+        m.LLM_URL = base
+        for answer, want in ((False, "Cancelled. Nothing was changed."),
+                             (True, "Done. circ fan -> 5/10 confirmed.")):
+            hist = [{"role": "system", "content": "s"}]
+            reply, _, used, _ = m.chat_turn("m", hist, "Turn the circulation fan up to 5.",
+                                            "ollama", True, log=lambda *a: None,
+                                            confirm=lambda q, a=answer: a)
+            assert reply == want
+            assert used[0]["parsed"] is True
+        assert llm_calls == [], "a parsed control request must not reach the model"
+        assert log.read_text().strip() == "set circ 5"          # ran once, after the yes
+        hist = [{"role": "system", "content": "s"}]
+        reply, _, _, _ = m.chat_turn("m", hist, "Set the light to 20 percent", "ollama", True,
+                                     log=lambda *a: None, confirm=lambda q: True)
+        assert reply.startswith("I can't do that: light must be 0") and "Nothing was changed" in reply
+    finally:
+        os.environ["PATH"] = old
+        srv.shutdown()

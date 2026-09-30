@@ -44,6 +44,7 @@ sysmsg = {"role": "system", "content": m.SYSTEM_PROMPT + m.TOOLS_HINT.format(
     today=time.strftime("%A %B %-d, %Y"))}
 sink = open(os.devnull, "w")
 passes = searched = 0
+src_ok = src_wrong = warn_on_correct = warn_on_wrong = 0
 lat = []
 for q, key in QA:
     row = []
@@ -53,7 +54,9 @@ for q, key in QA:
         t0 = time.time()
         stdout, sys.stdout = sys.stdout, sink       # stream_reply prints tokens
         try:
-            reply, ttft, used, _ = m.chat_turn(MODEL, hist, q, "ollama", True, log=lambda *a: None)
+            found = []
+            reply, ttft, used, _ = m.chat_turn(MODEL, hist, q, "ollama", True,
+                                               log=lambda *a: None, found=found)
         finally:
             sys.stdout = stdout
         dt = time.time() - t0
@@ -61,6 +64,18 @@ for q, key in QA:
         ok = bool(re.search(key, reply, re.I))
         s = any(u["name"] == "web_search" for u in used)
         passes += ok; searched += s
+        src = m.attribute(reply, found, q) if (s and found and reply) else None
+        if src is not None:
+            # a source is right when it actually contains the verified answer
+            if re.search(key, src["title"] + " " + src["content"], re.I):
+                src_ok += 1
+            else:
+                src_wrong += 1
+        elif s and found and reply:
+            if ok:
+                warn_on_correct += 1
+            else:
+                warn_on_wrong += 1
         row.append(f"{'PASS' if ok else 'FAIL'}{'' if s else '(no search)'} {dt:.1f}s")
         if not ok:
             qs = [u["args"].get("query") for u in used]
@@ -70,3 +85,6 @@ n = len(QA) * RUNS
 lat.sort()
 print(f"\n{CONFIG}: {passes}/{n} correct, searched in {searched}/{n}, "
       f"median {lat[len(lat)//2]:.1f}s, max {lat[-1]:.1f}s")
+print(f"sources: {src_ok} cite a result containing the answer, {src_wrong} cite one "
+      f"that does not; 'not in results' warnings: {warn_on_wrong} on wrong answers, "
+      f"{warn_on_correct} on correct ones")

@@ -321,6 +321,69 @@ docker run -d --name searxng --restart unless-stopped \
 Mount the settings file read-only. With the directory mounted read-write, the
 container changed the file's owner to its own user.
 
+### Grow control, confirmed before anything changes
+
+A third tool, **`grow_control`**, changes one output: VIVOSUN light
+(0 or 25–100 %), duct fan (0–10) or circulation fan (0–10 or `natural`), or an
+AC Infinity port 1–4 (speed 0–10, or a mode: on, off, auto, vpd, cycle,
+schedule). It runs the same `vivosun set` / `acinf set|mode` commands as the
+control windows.
+
+**The request is parsed by npu-chat, not left to the model.** Offered the tool,
+`qwen3.5:9b` called it for only 2 of 12 spoken requests, and 3 of 12 with
+`tool_choice` forcing it, since ollama doesn't enforce that
+(`evals/eval_control.py`). It never called it for the light or the duct fan.
+Once it said "I'll increase your circulation fan to speed 5 right now" and
+called nothing. The vocabulary is small (light, duct fan, circulation fan,
+port 1–4, a number, off, natural, a mode), so "turn the circulation fan up to
+5", "turn the grow light off", "switch port 4 to schedule" and "turn port two
+off" are parsed directly and never reach the model. Anything relative ("up by
+2") or ambiguous ("turn up the fans") goes to the model. If a request to change
+something ends with nothing having run, you hear **"Nothing was changed."**,
+whatever the model said.
+
+Parsed or not, a request is never run as it comes:
+
+1. npu-chat checks it against that list and refuses anything else, such as light
+   at 20 %, port 7, or `5; rm -rf ~`. The model hears "not allowed", and nothing
+   runs.
+2. It builds the question from the cached readings, **including the side effect
+   on mode**, then shows it and speaks it:
+
+   ```
+   ? AC Infinity port 4: set it to 6 out of 10? It is in schedule mode at 7 out
+     of 10 now. That ends its schedule mode and makes it manual.
+   Enter do it · x cancel
+   ```
+
+   Both CLIs change modes when they set a level. `acinf set` puts the port in
+   manual "on" (0 means off), and `vivosun set` puts that output in manual. A
+   voice command that silently ended a schedule would be the wrong kind of
+   surprise.
+3. Only Enter, `y` or `yes` runs it. Anything else, or no answer, cancels, and
+   the model is told nothing changed. The command's own output (`vivosun`
+   reports confirmed / already / unconfirmed) goes back to the model and into
+   the session log.
+
+Tested live on the real hardware with values it already had: `circ 3`, and
+VIVOSUN answered "already at 3/10 in manual mode; nothing changed". AC
+Infinity port 1 at 3: the write went through and the port read back unchanged.
+Two real requests answered with `x` changed nothing.
+
+The confirmation is part of the interactive loop only. Nothing else that calls
+`chat_turn()`, such as the evals and tests, can change hardware.
+
+### Where an answer came from
+
+After a search, npu-chat checks the reply against the results itself instead of
+trusting the model to cite. The supporting result is the one that shares the
+most of the reply's names and numbers ("Seahawks", "Patriots", "29"). Its site
+is printed with the link, and spoken if the model did not already name it
+("Source: FIFA."). If **no** result supports the reply, you hear "I could not
+find that in the search results, so treat it with care." An earlier run
+invented "Chiefs 61–9, as reported by ESPN" from results that said nothing of
+the kind. That reply matches none of them, so it would have been flagged.
+
 ### Picking up where you left off (`--resume`)
 
 `npu-chat --resume` reloads the user/assistant turns of the most recent chat
