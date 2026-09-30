@@ -140,8 +140,9 @@ stop_rec() {
 
   # Reject taps too short to hold speech. This server does not return
   # no_speech_prob (response_format=verbose_json yields {model,text} only) and
-  # large-v3-turbo hallucinates stock phrases on near-silence, so duration is the
-  # only cheap signal. RMS/peak are logged to calibrate a real gate later.
+  # large-v3-turbo hallucinates stock phrases on near-silence. RMS cannot
+  # separate speech from noise on this mic (they overlap), so the real gate is
+  # the Silero speech check below; RMS/peak stay in the log for reference.
   local metrics dur
   metrics=$(audio_metrics "${WAV}") || metrics=""
   if [[ -n "${metrics}" ]]; then
@@ -151,6 +152,24 @@ stop_rec() {
       log "discarded: ${dur}s is below the ${MIN_SECS}s floor"
       state idle
       notify "too short"
+      return 0
+    fi
+  fi
+
+  # Speech check (Silero VAD via npu-vad, ~0.13 s): noise typed as "Thank
+  # you." into whatever window has focus is worse than typing nothing.
+  # Exit 2 = the check cannot run (no model/onnxruntime); dictate unfiltered.
+  local vad="" vad_rc=2
+  local vad_bin
+  vad_bin=$(command -v npu-vad || true)
+  [[ -z "${vad_bin}" && -x "$(dirname "$0")/npu-vad" ]] && vad_bin="$(dirname "$0")/npu-vad"
+  if [[ -n "${vad_bin}" ]]; then
+    vad=$("${vad_bin}" "${WAV}" 2>/dev/null) && vad_rc=0 || vad_rc=$?
+    log "speech check: peak ${vad} (rc ${vad_rc})"
+    if [[ ${vad_rc} -eq 1 ]]; then
+      log "discarded: no speech detected (peak ${vad})"
+      state idle
+      notify "no speech detected"
       return 0
     fi
   fi

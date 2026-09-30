@@ -848,3 +848,41 @@ def test_resume_picks_latest_chat_session_and_skips_the_rest(tmp_path):
         {"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"},
         {"role": "user", "content": "17x3?"}, {"role": "assistant", "content": "51"}]
     assert m.latest_chat_log(str(tmp_path / "empty")) is None
+
+
+# --- npu-vad (the speech check npu-dictate uses) ---------------------------------
+
+def test_npu_vad_exit_codes_and_parity_with_npu_chat(tmp_path):
+    """Silence exits 1, speech exits 0, and the peak matches npu-chat's gate."""
+    import pytest
+
+    m = _load_chat()
+    silence = _wav16k(tmp_path / "silence.wav", [0] * 32000)
+    r = subprocess.run([sys.executable, "npu-vad", silence], capture_output=True, text=True)
+    if r.returncode == 2:
+        pytest.skip("Silero VAD model or onnxruntime not available")
+    assert r.returncode == 1 and float(r.stdout) < m.VAD_MIN
+    assert abs(float(r.stdout) - m.vad_peak(silence)) < 1e-3
+    voice = m.find_voice(m.DEFAULT_VOICE)
+    if not (voice and shutil.which("piper-tts")):
+        pytest.skip("no piper voice to synthesise speech")
+    raw, speech = tmp_path / "raw.wav", tmp_path / "speech.wav"
+    subprocess.run(["piper-tts", "-m", voice, "-f", str(raw)], input=b"Type this sentence.",
+                   capture_output=True, check=True)
+    subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(raw),
+                    "-ar", "16000", "-ac", "1", str(speech)], check=True)
+    r = subprocess.run([sys.executable, "npu-vad", str(speech)], capture_output=True, text=True)
+    assert r.returncode == 0
+    assert abs(float(r.stdout) - m.vad_peak(str(speech))) < 1e-3
+
+
+def test_npu_vad_reports_unavailable_without_model(tmp_path):
+    env = dict(os.environ, NPU_CHAT_VAD_MODEL=str(tmp_path / "missing.onnx"))
+    r = subprocess.run([sys.executable, "npu-vad", _wav16k(tmp_path / "s.wav", [0] * 16000)],
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 2 and r.stdout.strip() == "unavailable"
+
+
+def test_dictate_uses_the_speech_check():
+    src = open("npu-dictate").read()
+    assert "npu-vad" in src and "no speech detected" in src

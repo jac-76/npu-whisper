@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""npu-vad - is there speech in this WAV? (Silero VAD, ONNX, CPU)
+
+usage: npu-vad FILE.wav     (16 kHz mono)
+prints the peak speech probability; exit 0 = speech, 1 = no speech,
+2 = cannot tell (model, numpy or onnxruntime missing, or unreadable file).
+
+whisper large-v3-turbo invents text from room noise ("Thank you.",
+"Продолжение следует..."), so npu-dictate asks this first and types nothing
+when there is no speech. Same model and threshold as npu-chat's gate
+(keep the two in step; a test compares them):
+
+  room noise x6        peak 0.011 - 0.074
+  quiet speech x3      peak 0.163 - 0.414   (whisper transcribed it correctly)
+  normal speech x3     peak 0.954 - 0.997
+
+Silero's usual 0.5 would discard the quiet speech, so the cutoff is 0.12.
+"""
+
+import os
+import sys
+import wave
+
+VAD_MODEL = os.path.expanduser(os.environ.get(
+    "NPU_CHAT_VAD_MODEL", "~/.local/share/silero-vad/silero_vad.onnx"))
+VAD_MIN = float(os.environ.get("NPU_CHAT_VAD_MIN", "0.12"))
+
+
+def peak(path: str) -> float | None:
+    try:
+        import numpy as np
+        import onnxruntime as ort
+        sess = ort.InferenceSession(VAD_MODEL, providers=["CPUExecutionProvider"])
+        with wave.open(path, "rb") as w:
+            if w.getframerate() != 16000 or w.getnchannels() != 1:
+                return None
+            x = np.frombuffer(w.readframes(w.getnframes()),
+                              dtype=np.int16).astype(np.float32) / 32768
+    except Exception:
+        return None
+    state = np.zeros((2, 1, 128), np.float32)
+    ctx = np.zeros((1, 64), np.float32)      # Silero v5+ wants 64 samples of context
+    sr = np.array(16000, np.int64)
+    best = 0.0
+    for i in range(0, len(x) - 511, 512):
+        inp = np.concatenate([ctx, x[None, i:i + 512]], axis=1)
+        p, state = sess.run(None, {"input": inp, "state": state, "sr": sr})
+        ctx = inp[:, -64:]
+        best = max(best, float(p[0, 0]))
+    return best
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 2 if len(sys.argv) != 2 else 0
+    if os.environ.get("NPU_CHAT_VAD", "1") == "0":
+        print("off")
+        return 2
+    p = peak(sys.argv[1])
+    if p is None:
+        print("unavailable")
+        return 2
+    print(f"{p:.3f}")
+    return 0 if p >= VAD_MIN else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

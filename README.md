@@ -584,11 +584,19 @@ There is no good gate for it, and both candidates were measured and rejected:
   Real speech sits 8 % above a hallucinating noise capture. Any RMS threshold
   either passes the hallucinations or discards real speech.
 
-So `npu-dictate` enforces only a duration floor (`NPU_DICTATE_MIN_SECS`,
-default 0.4 s) and logs RMS/peak per capture to
-`~/.local/state/npu-dictate/dictate.log`. Push-to-talk is what actually bounds
-the exposure: audio is captured only while the key is held. A real fix needs a
-VAD pass (e.g. Silero) ahead of transcription.
+So `npu-dictate` asks **`npu-vad`** first: the same Silero speech check and 0.12
+cutoff as npu-chat (see "Speech gate"), in about 0.13 s. With no speech in
+the capture it types nothing and shows "no speech detected". Tested end to
+end with a stand-in `wtype`: a room-noise capture (peak 0.014) was discarded,
+while normal speech (0.997) and quiet speech (0.414) were transcribed and typed
+correctly. If the check can't run (no model or onnxruntime), dictation carries
+on unfiltered, as before. A duration floor (`NPU_DICTATE_MIN_SECS`, 0.4 s) still
+applies, and each capture's RMS, peak and speech score go to
+`~/.local/state/npu-dictate/dictate.log`.
+
+```sh
+install -m755 npu-vad ~/.local/bin/
+```
 
 ## How it works
 
