@@ -989,6 +989,32 @@ def test_plan_control_validates_and_states_mode_changes():
             m.plan_control(*bad, acinf_tip=_ACINF, vivo_tip=_VIVO)
 
 
+def test_plan_control_rejects_non_whole_numbers():
+    import pytest
+
+    m = _load_chat()
+    for v in ("inf", "1e999", "0.6", "nan", "-1", "5.5"):
+        for device, target in (("vivosun", "duct"), ("acinfinity", "4")):
+            with pytest.raises(ValueError):
+                m.plan_control(device, target, v, "", "")
+    assert m.plan_control("vivosun", "duct", "5.0", "", "")[0] == ["vivosun", "set", "duct", "5"]
+    assert m.plan_control("vivosun", "light", "50%", "", "")[0][-1] == "50"
+
+    def never(_argv):
+        raise AssertionError("run_control must not be reached")
+    m.run_control = never
+    m._cached_tooltip = lambda c: ""
+    result = m.run_tool("grow_control", '{"device":"vivosun","target":"duct","value":"inf"}',
+                        confirm=lambda q: True)[1]
+    assert result.startswith("not allowed"), result
+
+
+def test_plan_control_warns_when_mode_is_unknown():
+    m = _load_chat()
+    q = m.plan_control("acinfinity", "4", "6", acinf_tip="", vivo_tip="")[1]
+    assert "could not be read" in q and "makes it manual" in q
+
+
 def test_grow_control_never_runs_without_a_yes(tmp_path):
     m = _load_chat()
     log = tmp_path / "ran.txt"
