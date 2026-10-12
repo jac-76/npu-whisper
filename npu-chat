@@ -1655,6 +1655,41 @@ class ClaudeHarness:
                     return
 
 
+def _drop_typeahead() -> None:
+    """Discard keys typed before a question was shown (e.g. a barge-in Enter).
+
+    Called before the question is printed, never after: a key typed once the
+    question is visible is a deliberate answer and must not be thrown away."""
+    try:
+        import termios
+        if sys.stdin.isatty():
+            termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def confirm_action(question: str, speaker=None, speak: bool = False, ask=input) -> bool:
+    """Grow control changes real hardware: say it, show it, wait for an answer.
+    Only y / yes goes ahead. Enter alone, anything else, or no input cancels:
+    Enter is also the push-to-talk and barge-in key, and a reflexive Enter to
+    silence the spoken question must not approve the change. Keys typed
+    before the question appeared (a barge-in Enter, an Enter during
+    transcription) are discarded first."""
+    _drop_typeahead()
+    print(f"\n{YELLOW}{BOLD}? {question}{RESET}", flush=True)
+    if speak and speaker:
+        speaker.say(question + " Type y and press Enter to do it.")
+    try:
+        ans = ask(f"{DIM}y do it · Enter or x cancel{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        ans = "x"
+    if speaker:
+        speaker.stop()
+    ok = ans in ("y", "yes")
+    print(f"{DIM}{'confirmed' if ok else 'cancelled'}.{RESET}")
+    return ok
+
+
 def confirm_transcript(said: str, ask=input) -> str | None:
     """Voice turns go to the agent only once confirmed.
 
@@ -1662,6 +1697,7 @@ def confirm_transcript(said: str, ask=input) -> str | None:
     "So, like, this always happens."), and an agent would act on them.
     Enter sends, x discards, anything else replaces the transcript.
     """
+    _drop_typeahead()
     print(f"{DIM}Enter send · x discard · or type a correction{RESET}")
     try:
         answer = ask(f"{YELLOW}send?{RESET} ").strip()
@@ -2069,22 +2105,6 @@ def main() -> int:
 
     speaker = Speaker(voice_path) if voice_path and tts_ready() else None
 
-    def confirm_action(question: str) -> bool:
-        """Grow control changes real hardware: say it, show it, wait for Enter.
-        Only Enter / y / yes goes ahead; anything else, or no input, cancels."""
-        print(f"\n{YELLOW}{BOLD}? {question}{RESET}")
-        if speaking and speaker:
-            speaker.say(question + " Press Enter to do it, or x to cancel.")
-        try:
-            ans = input(f"{DIM}Enter do it · x cancel{RESET} ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            ans = "x"
-        if speaker:
-            speaker.stop()
-        ok = ans in ("", "y", "yes")
-        print(f"{DIM}{'confirmed' if ok else 'cancelled'}.{RESET}")
-        return ok
-
     while True:
         try:
             line = input(f"{CYAN}{BOLD}you{RESET} ").strip()
@@ -2196,7 +2216,8 @@ def main() -> int:
         reply, ttft, used, grow_attached = chat_turn(
             model, history, user_text, llm_server, tools_on,
             on_delta=speaker.feed if voiced else None, found=found,
-            confirm=confirm_action)
+            # Reads speaker/speaking when called, so /voice and /speak apply.
+            confirm=lambda q: confirm_action(q, speaker, speaking))
         total = time.time() - t_turn
         if (tools_on and reply and control_intent(user_text)
                 and not any(u["name"] == "grow_control" for u in used)):

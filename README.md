@@ -353,15 +353,17 @@ Parsed or not, a request is never run as it comes:
    ```
    ? AC Infinity port 4: set it to 6 out of 10? It is in schedule mode at 7 out
      of 10 now. That ends its schedule mode and makes it manual.
-   Enter do it · x cancel
+   y do it · Enter or x cancel
    ```
 
    Both CLIs change modes when they set a level. `acinf set` puts the port in
    manual "on" (0 means off), and `vivosun set` puts that output in manual. A
    voice command that silently ended a schedule would be the wrong kind of
    surprise.
-3. Only Enter, `y` or `yes` runs it. Anything else, or no answer, cancels, and
-   the model is told nothing changed. The command's own output (`vivosun`
+3. Only `y` or `yes` runs it. Enter alone, anything else, or no answer
+   cancels, and the model is told nothing changed. Enter is also the
+   push-to-talk and barge-in key, so it never approves a change, and keys
+   pressed before the question appeared are discarded. The command's own output (`vivosun`
    reports confirmed / already / unconfirmed) goes back to the model and into
    the session log.
 

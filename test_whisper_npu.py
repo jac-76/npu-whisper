@@ -445,6 +445,53 @@ def test_confirm_gate():
     assert m.confirm_transcript("anything", ask=eof) is None
 
 
+def test_confirm_action_ignores_keys_typed_before_the_question(tmp_path):
+    """An Enter pressed to barge in, or during transcription, sat in the
+    terminal buffer and answered the hardware question before it was shown."""
+    import pty
+    import time
+
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import time, types\n"
+        "m = types.ModuleType('npu_chat')\n"
+        f"exec(compile(open({os.path.abspath('npu-chat')!r}).read(), 'npu-chat', 'exec'), m.__dict__)\n"
+        "time.sleep(0.5)\n"
+        "print('RESULT', m.confirm_action('Set the duct fan to 5?'), flush=True)\n"
+    )
+    master, slave = pty.openpty()
+    p = subprocess.Popen([sys.executable, "-u", str(child)], stdin=slave,
+                         stdout=subprocess.PIPE, text=True)
+    os.close(slave)
+    try:
+        time.sleep(0.1)
+        os.write(master, b"y\n")  # the stale key, typed before the question
+        for line in p.stdout:
+            if "Set the duct fan to 5?" in line:
+                break
+        os.write(master, b"x\n")  # the real answer
+        rest = p.stdout.read()
+        p.wait(timeout=10)
+    finally:
+        os.close(master)
+        if p.poll() is None:
+            p.kill()
+    assert "RESULT False" in rest
+
+
+def test_confirm_action_answers():
+    m = _load_chat()
+    assert m.confirm_action("q?", ask=lambda _: "y") is True
+    assert m.confirm_action("q?", ask=lambda _: "YES") is True
+    assert m.confirm_action("q?", ask=lambda _: "x") is False
+    # Enter alone cancels: it is also the push-to-talk and barge-in key.
+    assert m.confirm_action("q?", ask=lambda _: "") is False
+
+    def eof(_):
+        raise EOFError
+    assert m.confirm_action("q?", ask=eof) is False
+
+
 def test_spoken_summary_and_api_error():
     m = _load_chat()
     s = m.spoken_summary("Fixed **it**. Tests pass. One. Two. Three.")
