@@ -1071,13 +1071,37 @@ def test_parse_control_phrasings():
         "switch port 4 to schedule": ("acinfinity", "4", "schedule"),
         "set the circ fan to natural": ("vivosun", "circ", "natural"),
         "turn the circ fan to five": ("vivosun", "circ", "5"),
+        "Can you set the duct fan to 4?": ("vivosun", "duct", "4"),
+        "Okay, turn the grow light off.": ("vivosun", "light", "0"),
+        "Um, turn the light off.": ("vivosun", "light", "0"),
+        "set the circ fan to 5 out of 10": ("vivosun", "circ", "5"),
     }
     for text, want in cases.items():
         assert m.parse_control(text) == want, text
     for text in ["What is the duct fan at?", "turn up the fans", "Turn off the TV",
-                 "set the light and the duct fan to 4", "turn the circ fan up by 2"]:
+                 "set the light and the duct fan to 4", "turn the circ fan up by 2",
+                 # timed, conditional or a question: these go to the model
+                 "turn port 2 off for 10 minutes",
+                 "turn the light off in 30 minutes",
+                 "How high should I set the light? It's at 75 percent",
+                 "Should I turn the duct fan to 5 for flowering?",
+                 "set the light to 1000",
+                 "turn the light off at 6 pm",
+                 "turn the lights off at 8am",
+                 "turn the light off at 8:30",
+                 "turn off the light for a while",
+                 "turn the light off at noon"]:
         assert m.parse_control(text) is None, text
     assert m.control_intent("turn up the fans") and not m.control_intent("what is the pH")
+
+
+def test_control_intent_ignores_questions():
+    m = _load_chat()
+    for text in ["How high should I set the light?", "Why do the fans turn off at night?",
+                 "Should I turn the duct fan to 5 for flowering?"]:
+        assert not m.control_intent(text), text
+    for text in ["turn up the fans", "Can you turn the fans up?"]:
+        assert m.control_intent(text), text
 
 
 def test_parsed_control_skips_the_model_and_reports_what_happened(tmp_path):

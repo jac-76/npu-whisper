@@ -338,7 +338,9 @@ called nothing. The vocabulary is small (light, duct fan, circulation fan,
 port 1–4, a number, off, natural, a mode), so "turn the circulation fan up to
 5", "turn the grow light off", "switch port 4 to schedule" and "turn port two
 off" are parsed directly and never reach the model. Anything relative ("up by
-2") or ambiguous ("turn up the fans") goes to the model. If a request to change
+2") or ambiguous ("turn up the fans") goes to the model, and so do questions
+("Should I turn the duct fan to 5?") and timed requests ("turn port 2 off for
+10 minutes"). If a request to change
 something ends with nothing having run, you hear **"Nothing was changed."**,
 whatever the model said.
 
