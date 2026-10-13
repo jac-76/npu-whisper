@@ -1167,3 +1167,36 @@ def test_parsed_control_skips_the_model_and_reports_what_happened(tmp_path):
     finally:
         os.environ["PATH"] = old
         srv.shutdown()
+
+
+def test_npu_vad_runtime_error_means_cannot_tell(tmp_path):
+    import pytest
+    pytest.importorskip("numpy")
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "onnxruntime.py").write_text(
+        "class InferenceSession:\n"
+        "    def __init__(self, *a, **k):\n        pass\n"
+        "    def run(self, *a, **k):\n"
+        "        raise RuntimeError('Invalid input name: state')\n")
+    wav = tmp_path / "a.wav"
+    _wav16k(wav, [0] * 16000)
+    r = subprocess.run([sys.executable, "npu-vad", str(wav)], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(fake),
+                            "NPU_CHAT_VAD_MODEL": str(tmp_path / "any.onnx")})
+    assert r.returncode == 2
+    assert r.stdout.strip() == "unavailable"
+
+
+def test_vad_runtime_error_turns_the_gate_off(tmp_path):
+    import pytest
+    pytest.importorskip("numpy")
+    m = _load_chat()
+
+    class Broken:
+        def run(self, *a, **k):
+            raise RuntimeError("Invalid input name: state")
+    m._VAD["session"] = Broken()
+    wav = tmp_path / "a.wav"
+    _wav16k(wav, [0] * 16000)
+    assert m.vad_peak(str(wav)) is None

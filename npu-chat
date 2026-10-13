@@ -971,11 +971,20 @@ def vad_probs(path: str) -> list[float] | None:
     ctx = np.zeros((1, 64), np.float32)          # Silero v5+ wants 64 samples of context
     sr = np.array(16000, np.int64)
     out = []
-    for i in range(0, len(x) - 511, 512):
-        inp = np.concatenate([ctx, x[None, i:i + 512]], axis=1)
-        p, state = sess.run(None, {"input": inp, "state": state, "sr": sr})
-        ctx = inp[:, -64:]
-        out.append(float(p[0, 0]))
+    try:
+        for i in range(0, len(x) - 511, 512):
+            inp = np.concatenate([ctx, x[None, i:i + 512]], axis=1)
+            p, state = sess.run(None, {"input": inp, "state": state, "sr": sr})
+            ctx = inp[:, -64:]
+            out.append(float(p[0, 0]))
+    except Exception as exc:
+        # An incompatible model fails here, not at load: turn the gate off
+        # (capture goes on unfiltered) instead of ending the chat loop.
+        if not _VAD["warned"]:
+            print(f"{DIM}speech gate off ({exc}); noise is not filtered. "
+                  f"See README, Silero VAD.{RESET}")
+            _VAD["warned"] = True
+        return None
     return out
 
 

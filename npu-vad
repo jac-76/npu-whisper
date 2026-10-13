@@ -57,7 +57,13 @@ def main() -> int:
     if os.environ.get("NPU_CHAT_VAD", "1") == "0":
         print("off")
         return 2
-    p = peak(sys.argv[1])
+    # An ONNX Runtime error (a Silero v4 model has h/c inputs, not state)
+    # must mean "cannot tell" (2), never the uncaught-exception exit 1 that
+    # this tool defines as "no speech" -- npu-dictate then dropped every capture.
+    try:
+        p = peak(sys.argv[1])
+    except Exception:
+        p = None
     if p is None:
         print("unavailable")
         return 2
