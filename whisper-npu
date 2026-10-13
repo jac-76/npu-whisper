@@ -85,7 +85,9 @@ start_server() {
     msg "flm serve (pid ${pid}) is still starting; waiting for it..."
   else
     msg "starting flm ASR server (loading whisper-v3:turbo)..."
-    nohup flm serve --asr 1 --host 127.0.0.1 >"${LOGFILE}" 2>&1 &
+    # 9>&-: the server must not inherit the lock, or it holds it for as long
+    # as it runs and every later start (ours or local-ai-assistant's) hangs.
+    nohup flm serve --asr 1 --host 127.0.0.1 >"${LOGFILE}" 2>&1 9>&- &
     pid=$!
     echo "${pid}" >"${PIDFILE}"
   fi

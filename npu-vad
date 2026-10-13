@@ -23,7 +23,10 @@ import wave
 
 VAD_MODEL = os.path.expanduser(os.environ.get(
     "NPU_CHAT_VAD_MODEL", "~/.local/share/silero-vad/silero_vad.onnx"))
-VAD_MIN = float(os.environ.get("NPU_CHAT_VAD_MIN", "0.12"))
+try:
+    VAD_MIN = float(os.environ.get("NPU_CHAT_VAD_MIN", "0.12"))
+except ValueError:
+    VAD_MIN = 0.12
 
 
 def peak(path: str) -> float | None:
@@ -72,4 +75,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Exit 1 means "no speech" and makes npu-dictate drop the capture, so a
+    # crash anywhere -- Python's own uncaught-exception code is 1 -- is 2.
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"unavailable ({exc})", file=sys.stderr)
+        sys.exit(2)

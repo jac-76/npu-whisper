@@ -969,7 +969,7 @@ def test_attribution_finds_support_and_flags_inventions():
 
 # --- grow control: validated, confirmed, then run ----------------------------------
 
-_ACINF = "Infinity 69 Pro: 74F\n  1. Port 1: on @ 3/10\n  4. Port 4: schedule @ 7/10  (2h left)"
+_ACINF = "Infinity 69 Pro: 74F\n  1. Port 1: on @ 3/10\n  4. Exhaust: schedule @ 7/10  (2h left)"
 _VIVO = "GrowHub E42A: 68F\n  light 100% · duct fan 3/10 · circ fan 3/10"
 
 
@@ -1206,6 +1206,33 @@ def test_vad_runtime_error_turns_the_gate_off(tmp_path):
     wav = tmp_path / "a.wav"
     _wav16k(wav, [0] * 16000)
     assert m.vad_peak(str(wav)) is None
+    # Off for the rest of the session: later captures do not pay for it again.
+    assert m._VAD["session"] is False
+    assert m.vad_peak(str(wav)) is None
+
+
+def test_npu_vad_crash_outside_peak_means_cannot_tell(tmp_path):
+    wav = tmp_path / "a.wav"
+    _wav16k(wav, [0] * 16000)
+    # A bad threshold used to raise at import: Python's exit 1, read as "no speech".
+    r = subprocess.run([sys.executable, "npu-vad", str(wav)], capture_output=True, text=True,
+                       env={**os.environ, "NPU_CHAT_VAD_MIN": "abc",
+                            "NPU_CHAT_VAD_MODEL": str(tmp_path / "none.onnx")})
+    assert r.returncode == 2
+
+
+def test_sigint_keeps_keyboard_interrupt():
+    import signal as sig
+    m = _load_chat()
+    saved = {s: sig.getsignal(s) for s in (sig.SIGINT, sig.SIGTERM, sig.SIGHUP)}
+    try:
+        m._HANDLERS_SET = False
+        m._install_cleanup_handlers()
+        assert sig.getsignal(sig.SIGINT) is saved[sig.SIGINT]
+        assert sig.getsignal(sig.SIGTERM) == m._cleanup_and_die
+    finally:
+        for s, h in saved.items():
+            sig.signal(s, h)
 
 
 def test_nothing_changed_note_in_every_mode():
@@ -1223,8 +1250,14 @@ def test_source_verdict():
     m = _load_chat()
     seattle = [{"title": "Seattle Seahawks win", "url": "https://nfl.com/x",
                 "content": "The Seattle Seahawks beat the Patriots."}]
-    assert m.source_verdict("Seattle won 29-13.", seattle, "Who won?", grow_attached=True) == \
+    # Numbers from the attached grow readings need no web source...
+    assert m.source_verdict("The tent is at 62% humidity.", seattle,
+                            "Is the tent too humid outside today?", "humidity 62% temp 74F") == \
         ("skip", None)
+    # ...but a weather claim alongside them is still checked.
+    assert m.source_verdict("It's 12 degrees and raining in Portland; the tent is at 62%.",
+                            seattle, "What's the weather outside, and is the tent humid?",
+                            "humidity 62%")[0] == "unsupported"
     assert m.source_verdict("Yes, it is raining.", seattle, "Is it raining?") == ("skip", None)
     assert m.source_verdict("Seattle's defense won it.", seattle, "Who won?")[0] == "ok"
     chiefs = [{"title": "Chiefs news", "url": "https://x.com/a",
@@ -1429,3 +1462,14 @@ def test_start_reports_an_early_exit(tmp_path):
     assert _t.monotonic() - started < 10
     assert "exited" in r.stderr + r.stdout
     assert not pidfile.exists()
+
+
+def test_flm_serve_does_not_inherit_the_lock(tmp_path):
+    mark = tmp_path / "fd9"
+    env, _, pidfile = _flm_env(
+        tmp_path, f'#!/bin/sh\nif [ -e /proc/self/fd/9 ]; then echo held; else echo free; fi'
+                  f' > "{mark}"\nexit 1\n')
+    subprocess.run(["bash", "whisper-npu", "--start"], env=env, capture_output=True,
+                   text=True, timeout=30)
+    assert mark.read_text().strip() == "free"
+

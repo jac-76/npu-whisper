@@ -107,6 +107,9 @@ wait_gone() {
     sleep 0.05
   done
   log "recorder ${pid} still running after 5 s; sending KILL"
+  # ${pid} is coreutils timeout; killing only it would orphan pw-record,
+  # which then records with no limit. Kill its children first.
+  pkill -KILL -P "${pid}" 2>/dev/null || true
   kill -KILL "${pid}" 2>/dev/null || true
 }
 

@@ -319,7 +319,8 @@ def site_name(url: str, title: str = "") -> str:
     return "-".join(p.capitalize() for p in label.split("-"))
 
 
-def attribute(reply: str, found: list[dict], question: str = "") -> dict | None:
+def attribute(reply: str, found: list[dict], question: str = "",
+              ev: set[str] | None = None) -> dict | None:
     """The search result that best supports the reply, or None.
 
     A result supports it when it shares the reply's names and numbers - the
@@ -328,7 +329,8 @@ def attribute(reply: str, found: list[dict], question: str = "") -> dict | None:
     None after a search means the answer is in none of the results - the case
     where a model had invented "Chiefs 61-9, reported by ESPN".
     """
-    ev = _checkable(reply, question)
+    if ev is None:
+        ev = _checkable(reply, question)
     pats = [_evidence_pattern(e) for e in ev]
     best, best_score = None, 0
     for r in found:
@@ -353,13 +355,18 @@ def _checkable(reply: str, question: str) -> set[str]:
 
 
 def source_verdict(reply: str, found: list[dict], question: str = "",
-                   grow_attached: bool = False) -> tuple[str, dict | None]:
-    """("skip", None): nothing to check (an answer from the grow readings, or
-    one with no names or numbers, such as "Yes, it is raining.");
-    ("unsupported", None): in none of the results; ("ok", source)."""
-    if grow_attached or not _checkable(reply, question):
+                   known: str = "") -> tuple[str, dict | None]:
+    """("skip", None): nothing to check (no names or numbers beyond the
+    question and `known`, such as "Yes, it is raining."); ("unsupported",
+    None): in none of the results; ("ok", source).
+
+    `known` is text the reply may quote without a web source -- the grow
+    readings attached this turn -- so "the tent is at 62%" is not held
+    against the weather results, while the weather part still is."""
+    ev = _checkable(reply, f"{question} {known}")
+    if not ev:
         return "skip", None
-    src = attribute(reply, found, question)
+    src = attribute(reply, found, question, ev=ev)
     return ("unsupported", None) if src is None else ("ok", src)
 
 
@@ -442,7 +449,8 @@ def plan_control(device: str, target: str, value: str,
             raise ValueError(f"acinfinity target must be a port 1-4, not {target!r}")
         port = m.group(1)
         tip = acinf_tip if acinf_tip is not None else _cached_tooltip("acinf")
-        cur = re.search(rf"Port {port}: (\S+) @ (\d+)/10", tip)
+        # acinf's tooltip line: "  2. <port name>: <mode> @ 7/10"
+        cur = re.search(rf"(?m)^\s*{port}\. [^:\n]+: (\S+) @ (\d+)/10", tip)
         cur_mode = cur.group(1) if cur else None
         now_txt = (f" It is in {cur.group(1)} mode at {cur.group(2)} out of 10 now."
                    if cur else "")
@@ -697,12 +705,14 @@ def history_from_log(path: str) -> list[dict]:
 
 def chat_turn(model: str, history: list[dict], user_text: str,
               server: str | None, tools_on: bool, on_delta=None,
-              log=print, found: list | None = None, confirm=None
+              log=print, found: list | None = None, confirm=None,
+              grow_out: list | None = None
               ) -> tuple[str, float | None, list[dict], bool]:
     """One user turn, tool calls included. Mutates `history`.
 
     Returns (reply, time to first text, tools used, grow readings attached).
-    Every search result seen this turn is appended to `found`, for attribution.
+    Every search result seen this turn is appended to `found`, for attribution,
+    and the grow readings attached to it to `grow_out`.
     On an empty reply the caller rolls history back.
     """
     if tools_on and confirm is not None:
@@ -719,6 +729,8 @@ def chat_turn(model: str, history: list[dict], user_text: str,
                               else (user_text, False))
     if grow_attached:
         log(f"{DIM}· reading grow status{RESET}")
+        if grow_out is not None:
+            grow_out.append(content[len(user_text):])
     used: list[dict] = []
     # A grow question ("What's the pH right now?") is answered from the
     # readings; sending it to public engines too only produced a false "not in
@@ -862,14 +874,17 @@ _HANDLERS_SET = False
 
 
 def _install_cleanup_handlers() -> None:
-    """SIGTERM/SIGHUP/SIGINT clean up the session dir. Only the main thread
+    """SIGTERM/SIGHUP clean up the session dir. SIGINT is left alone: it
+    stays KeyboardInterrupt, which the prompts use to cancel and which still
+    ends in atexit's cleanup (it used to exit the program from any prompt).
+    Only the main thread
     may install signal handlers: a first session_dir() call from the
     Speaker's synth thread used to set the dir but install none, and no
     later call retried, so closing the terminal left /tmp/npu-chat-* behind."""
     global _HANDLERS_SET
     if _HANDLERS_SET or threading.current_thread() is not threading.main_thread():
         return
-    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+    for sig in (signal.SIGTERM, signal.SIGHUP):
         try:
             signal.signal(sig, _cleanup_and_die)
         except (ValueError, OSError):
@@ -1043,6 +1058,8 @@ def vad_probs(path: str) -> list[float] | None:
     None when the model or onnxruntime is unavailable - then nothing is
     filtered, which is how npu-chat behaved before the gate existed.
     """
+    if _VAD["session"] is False:      # failed before; do not retry every capture
+        return None
     if _VAD["session"] is None:
         try:
             import numpy  # noqa: F401
@@ -1056,6 +1073,7 @@ def vad_probs(path: str) -> list[float] | None:
                 print(f"{DIM}speech gate off ({exc}); noise is not filtered. "
                       f"See README, Silero VAD.{RESET}")
                 _VAD["warned"] = True
+            _VAD["session"] = False
             return None
     import numpy as np
 
@@ -1085,6 +1103,7 @@ def vad_probs(path: str) -> list[float] | None:
             print(f"{DIM}speech gate off ({exc}); noise is not filtered. "
                   f"See README, Silero VAD.{RESET}")
             _VAD["warned"] = True
+        _VAD["session"] = False
         return None
     return out
 
@@ -2355,11 +2374,12 @@ def main() -> int:
             speaker.begin()
         t_turn = time.time()
         found: list[dict] = []
+        grow_text: list[str] = []
         reply, ttft, used, grow_attached = chat_turn(
             model, history, user_text, llm_server, tools_on,
             on_delta=speaker.feed if voiced else None, found=found,
             # Reads speaker/speaking when called, so /voice and /speak apply.
-            confirm=lambda q: confirm_action(q, speaker, speaking))
+            confirm=lambda q: confirm_action(q, speaker, speaking), grow_out=grow_text)
         total = time.time() - t_turn
         note = nothing_changed_note(user_text, reply, used, tools_on)
         if note:
@@ -2373,7 +2393,7 @@ def main() -> int:
         if reply and searched and found:
             # Say where it came from, checked against the results rather than
             # left to the model; flag answers that are in none of them.
-            verdict, source = source_verdict(reply, found, user_text, grow_attached)
+            verdict, source = source_verdict(reply, found, user_text, " ".join(grow_text))
             if verdict == "unsupported":
                 print(f"{YELLOW}! that answer is not in the search results - "
                       f"treat it with care{RESET}")
