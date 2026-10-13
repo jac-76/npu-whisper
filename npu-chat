@@ -176,14 +176,23 @@ def web_search(query: str, n: int = 8, found: list | None = None) -> str:
     lines = []
     # SearXNG's direct answers and infoboxes, when an engine gives one, are the
     # most specific thing it returns; put them first.
+    # Also into `found`: an answer taken from them was otherwise flagged as
+    # "not in the search results".
     for a in d.get("answers") or []:
         text = a.get("answer") if isinstance(a, dict) else str(a)
         if text:
-            lines.append(f"Answer: {' '.join(str(text).split())[:300]}")
+            shown = " ".join(str(text).split())[:300]
+            lines.append(f"Answer: {shown}")
+            if found is not None:
+                found.append({"title": "", "content": shown,
+                              "url": (a.get("url") or "") if isinstance(a, dict) else ""})
     for box in (d.get("infoboxes") or [])[:1]:
         body = " ".join((box.get("content") or "").split())[:400]
         if body:
             lines.append(f"Infobox ({box.get('infobox', '')}): {body}")
+            if found is not None:
+                found.append({"title": box.get("infobox") or "", "url": box.get("id") or "",
+                              "content": body})
     if not results and not lines:
         down = [f"{e[0]}: {e[1]}" for e in d.get("unresponsive_engines") or []
                 if isinstance(e, (list, tuple)) and len(e) >= 2]
@@ -243,9 +252,17 @@ CURRENT_WORDS = re.compile(
     r"next (game|match|race|election))\b", re.I)
 
 
+OUTSIDE_WORDS = re.compile(r"\b(outside|outdoors|weather|forecast)\b", re.I)
+
+
 _CITE_STOP = {"the", "and", "for", "with", "that", "this", "from", "was", "were",
               "are", "has", "have", "won", "who", "what", "which", "their", "they",
               "most", "recent", "year", "season", "according", "source", "yes", "its"}
+
+
+def _norm(word: str) -> str:
+    """"Seattle's" -> "seattle", so a possessive matches the plain name."""
+    return re.sub(r"'s$", "", word.lower()).strip("'-")
 
 
 def _evidence(text: str) -> set[str]:
@@ -254,7 +271,7 @@ def _evidence(text: str) -> set[str]:
     words = re.findall(r"[A-Za-z][A-Za-z'\-]+|\d+(?:\.\d+)?", text)
     out = set()
     for i, w in enumerate(words):
-        lw = w.lower().strip("'-")
+        lw = _norm(w)
         if lw in _CITE_STOP or len(lw) < 2:
             continue
         if w[0].isdigit() or (w[0].isupper() and len(w) >= 3):
@@ -298,9 +315,7 @@ def attribute(reply: str, found: list[dict], question: str = "") -> dict | None:
     None after a search means the answer is in none of the results - the case
     where a model had invented "Chiefs 61-9, reported by ESPN".
     """
-    asked = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'\-]+|\d+", question)}
-    asked.add(str(time.localtime().tm_year))
-    ev = _evidence(reply) - asked
+    ev = _checkable(reply, question)
     pats = [_evidence_pattern(e) for e in ev]
     best, best_score = None, 0
     for r in found:
@@ -308,9 +323,31 @@ def attribute(reply: str, found: list[dict], question: str = "") -> dict | None:
         score = sum(1 for p in pats if p.search(hay))
         if score > best_score:
             best, best_score = r, score
-    if best is None or best_score < min(2, len(ev)) or not ev:
+    # At least half of the reply's names and numbers: two shared tokens let an
+    # article that only mentioned Kansas City "support" a whole game score.
+    need = max(min(2, len(ev)), (len(ev) + 1) // 2)
+    if best is None or best_score < need or not ev:
         return None
-    return {**best, "site": site_name(best["url"], best["title"]), "score": best_score}
+    return {**best, "site": site_name(best["url"], best["title"]) or "the search answer box",
+            "score": best_score}
+
+
+def _checkable(reply: str, question: str) -> set[str]:
+    """The reply's names and numbers that the question did not already contain."""
+    asked = {_norm(w) for w in re.findall(r"[A-Za-z][A-Za-z'\-]+|\d+", question)}
+    asked.add(str(time.localtime().tm_year))
+    return _evidence(reply) - asked
+
+
+def source_verdict(reply: str, found: list[dict], question: str = "",
+                   grow_attached: bool = False) -> tuple[str, dict | None]:
+    """("skip", None): nothing to check (an answer from the grow readings, or
+    one with no names or numbers, such as "Yes, it is raining.");
+    ("unsupported", None): in none of the results; ("ok", source)."""
+    if grow_attached or not _checkable(reply, question):
+        return "skip", None
+    src = attribute(reply, found, question)
+    return ("unsupported", None) if src is None else ("ok", src)
 
 
 def search_query_for(text: str, year: int) -> str:
@@ -651,12 +688,15 @@ def chat_turn(model: str, history: list[dict], user_text: str,
     if grow_attached:
         log(f"{DIM}· reading grow status{RESET}")
     used: list[dict] = []
-    if tools_on:
+    # A grow question ("What's the pH right now?") is answered from the
+    # readings; sending it to public engines too only produced a false "not in
+    # the search results" warning. Unless it is about the weather outside.
+    if tools_on and CURRENT_WORDS.search(user_text) and (
+            not grow_attached or OUTSIDE_WORDS.search(user_text)):
         year = time.localtime().tm_year
-        if CURRENT_WORDS.search(user_text):
-            log(f"{DIM}· searching: {search_query_for(user_text, year)}{RESET}")
-            if on_delta:
-                on_delta("Let me check. ")
+        log(f"{DIM}· searching: {search_query_for(user_text, year)}{RESET}")
+        if on_delta:
+            on_delta("Let me check. ")
         content, q = with_search_context(user_text, content, year, found=found)
         if q:
             used.append({"name": "web_search", "args": {"query": q}, "auto": True})
@@ -2281,18 +2321,20 @@ def main() -> int:
         first_audio = None
         source = None
         searched = any(u["name"] == "web_search" for u in used)
+        verdict = None
         if reply and searched and found:
             # Say where it came from, checked against the results rather than
             # left to the model; flag answers that are in none of them.
-            source = attribute(reply, found, user_text)
-            if source is None:
+            verdict, source = source_verdict(reply, found, user_text, grow_attached)
+            if verdict == "unsupported":
                 print(f"{YELLOW}! that answer is not in the search results - "
                       f"treat it with care{RESET}")
                 if voiced:
                     speaker.feed(" I could not find that in the search results, "
                                  "so treat it with care. ")
-            else:
-                print(f"{DIM}source: {source['site']} - {source['url']}{RESET}")
+            elif verdict == "ok":
+                where = f" - {source['url']}" if source["url"] else ""
+                print(f"{DIM}source: {source['site']}{where}{RESET}")
                 if voiced and source["site"].lower() not in reply.lower():
                     speaker.feed(f" Source: {source['site']}. ")
         if reply:
@@ -2312,8 +2354,7 @@ def main() -> int:
                             tools=used or None,
                             grow_attached=grow_attached or None,
                             source=(source or {}).get("url") if searched else None,
-                            unsourced=(bool(reply) and searched and bool(found)
-                                       and source is None) or None,
+                            unsourced=(verdict == "unsupported") or None,
                             first_audio_secs=round(first_audio, 3) if first_audio else None,
                             vad_max_p=LAST_CAPTURE.get("vad_max_p") if audio_secs else None)
         print()

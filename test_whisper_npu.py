@@ -1211,3 +1211,63 @@ def test_nothing_changed_note_in_every_mode():
                                   True) is None
     assert m.nothing_changed_note("set the duct fan to 5", "ok",
                                   [{"name": "grow_control"}], True) is None
+
+
+def test_source_verdict():
+    m = _load_chat()
+    seattle = [{"title": "Seattle Seahawks win", "url": "https://nfl.com/x",
+                "content": "The Seattle Seahawks beat the Patriots."}]
+    assert m.source_verdict("Seattle won 29-13.", seattle, "Who won?", grow_attached=True) == \
+        ("skip", None)
+    assert m.source_verdict("Yes, it is raining.", seattle, "Is it raining?") == ("skip", None)
+    assert m.source_verdict("Seattle's defense won it.", seattle, "Who won?")[0] == "ok"
+    chiefs = [{"title": "Chiefs news", "url": "https://x.com/a",
+               "content": "Fans in Kansas City gathered."}]
+    assert m.source_verdict("The Kansas City Chiefs beat the Philadelphia Eagles 40-22.",
+                            chiefs, "Who won the Super Bowl?")[0] == "unsupported"
+
+
+def test_direct_answers_count_as_support():
+    m = _load_chat()
+
+    def handler(path, body):
+        return "application/json", json.dumps(
+            {"answers": [{"answer": "Spain"}],
+             "results": [{"title": "World Cup", "url": "https://fifa.com/a",
+                          "content": "The final was played in July."}]}).encode()
+    base, srv = _post_stub(handler)
+    try:
+        m.SEARX_URL = base
+        found = []
+        m.web_search("world cup 2026", found=found)
+    finally:
+        srv.shutdown()
+    assert m.source_verdict("Spain won the 2026 World Cup.", found,
+                            "Who won the World Cup this year?")[0] == "ok"
+
+
+def test_grow_questions_are_not_web_searched():
+    m = _load_chat()
+    queries = []
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            queries.append(path)
+            return "application/json", b'{"results": []}'
+        return _sse({"choices": [{"delta": {"content": "It is 5.8."}}]})
+
+    base, srv = _post_stub(handler)
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        m.grow_status = lambda: "pH 5.8"
+        hist = [{"role": "system", "content": "s"}]
+        out = m.chat_turn("m", hist, "What's the pH right now?", "ollama", True,
+                          log=lambda *a: None)
+        assert queries == []
+        assert out[3] is True                       # the readings were attached
+        m.chat_turn("m", hist, "What's the temperature outside today?", "ollama", True,
+                    log=lambda *a: None)
+        assert len(queries) == 1
+    finally:
+        srv.shutdown()

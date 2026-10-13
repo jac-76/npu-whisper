@@ -286,7 +286,9 @@ itself, with the year added, and the results are attached to your message. The
 model can still search again on its own. Grow questions work the same way:
 left to the model, 1 of 3 runs said "I can't see real-time grow room
 readings". With the readings attached whenever you mention the tent,
-reservoir, pH, humidity and so on, it got 6 of 6.
+reservoir, pH, humidity and so on, it got 6 of 6. A grow question is not also
+web-searched unless it mentions the weather outside (*outside*, *outdoors*,
+*weather*, *forecast*).
 
 The three remaining misses were all the Fed chair. At that moment the search
 engines returned furniture ("chairs") and Powell's official bio, not the news
@@ -381,7 +383,9 @@ The confirmation is part of the interactive loop only. Nothing else that calls
 
 After a search, npu-chat checks the reply against the results itself instead of
 trusting the model to cite. The supporting result is the one that shares the
-most of the reply's names and numbers ("Seahawks", "Patriots", "29"). Its site
+most of the reply's names and numbers ("Seahawks", "Patriots", "29"), and it must
+share at least half of them; answers drawn only from grow readings are not
+checked. Its site
 is printed with the link, and spoken if the model did not already name it
 ("Source: FIFA."). If **no** result supports the reply, you hear "I could not
 find that in the search results, so treat it with care." An earlier run
