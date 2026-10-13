@@ -944,6 +944,12 @@ def test_site_names():
     assert m.site_name("https://www.espn.com/x", "NFL History") == "ESPN"
     assert m.site_name("https://www.basketball-reference.com/p",
                        "Finals | Basketball-Reference.com") == "Basketball-Reference"
+    assert m.site_name("https://www.bbc.co.uk/sport/x", "") == "BBC"
+    assert m.site_name("https://www.abc.net.au/news/x", "") == "ABC"
+    assert m.site_name("https://www.masters.com/en_US/scores",
+                       "2026 Masters Tournament - Final Leaderboard") == "Masters"
+    assert m.site_name("https://www.nfl.com/news/x", "Seahawks beat Patriots 29 - 13") == "NFL"
+    assert m.site_name("https://www.bbc.co.uk/news/x", "Storm hits - BBC News") == "BBC News"
 
 
 def test_attribution_finds_support_and_flags_inventions():

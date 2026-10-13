@@ -294,13 +294,25 @@ def _evidence_pattern(e: str) -> re.Pattern:
 
 
 def site_name(url: str, title: str = "") -> str:
-    """'… - Wikipedia' -> Wikipedia; fifa.com -> FIFA; espn.com -> ESPN."""
-    m = re.search(r"\s[-|–—]\s([^-|–—]{2,30})$", title or "")
-    if m and len(m.group(1).split()) <= 3:
-        return m.group(1).strip()
+    """'… - Wikipedia' -> Wikipedia; fifa.com -> FIFA; bbc.co.uk -> BBC.
+
+    A trailing title segment wins only when it names the host ("… - BBC
+    News" on bbc.co.uk), so "… - Final Leaderboard" or "29 - 13" is never
+    spoken as the source. "" when there is no host."""
     host = (urllib.parse.urlsplit(url).hostname or "").lower()
     parts = [p for p in host.split(".") if p not in ("www", "en", "m", "amp")]
-    label = parts[-2] if len(parts) >= 2 else (parts[0] if parts else url)
+    if not parts:
+        return ""
+    # bbc.co.uk / abc.net.au: a second-level label under a 2-letter country.
+    if (len(parts) >= 3 and len(parts[-1]) == 2
+            and parts[-2] in ("co", "com", "net", "org", "gov", "ac", "edu")):
+        parts = parts[:-1]
+    label = parts[-2] if len(parts) >= 2 else parts[0]
+    m = re.search(r"\s[-|–—]\s([^-|–—]{2,30})$", title or "")
+    if m and len(m.group(1).split()) <= 3:
+        segment = m.group(1).strip()
+        if re.sub(r"[^a-z0-9]", "", label) in re.sub(r"[^a-z0-9]", "", segment.lower()):
+            return segment
     if len(label) <= 4:
         return label.upper()
     return "-".join(p.capitalize() for p in label.split("-"))
