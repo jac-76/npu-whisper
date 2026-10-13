@@ -98,6 +98,23 @@ except Exception:
 METRICS_EOF
 }
 
+wait_gone() {
+  # The recorder was started by an earlier `npu-dictate start` process, so it
+  # is not our child and `wait` returns at once. Poll until it has exited.
+  local pid="$1" i
+  for ((i = 0; i < 100; i++)); do
+    kill -0 "${pid}" 2>/dev/null || return 0
+    sleep 0.05
+  done
+  log "recorder ${pid} still running after 5 s; sending KILL"
+  kill -KILL "${pid}" 2>/dev/null || true
+}
+
+stop_recorder() {
+  kill -TERM "$1" 2>/dev/null || true
+  wait_gone "$1"
+}
+
 start_rec() {
   if recording_pid >/dev/null; then
     log "start ignored: already recording"
@@ -119,8 +136,11 @@ stop_rec() {
     state idle
     return 0
   fi
-  kill -INT "${pid}" 2>/dev/null || true
-  wait "${pid}" 2>/dev/null || true
+  # TERM, not INT: the recorder runs as a background job, which inherits
+  # SIGINT as ignored, and coreutils timeout (9.11 here) keeps it ignored --
+  # an INT never reached pw-record, which kept recording for up to MAX_SECS.
+  # timeout forwards TERM, and pw-record finishes its file on TERM as on INT.
+  stop_recorder "${pid}"
   rm -f "${PIDFILE}"
   state transcribing
 
@@ -272,8 +292,7 @@ case "${CMD}" in
   toggle) if recording_pid >/dev/null; then stop_rec; else ensure_server || true; start_rec; fi ;;
   cancel)
     if pid=$(recording_pid); then
-      kill -INT "${pid}" 2>/dev/null || true
-      wait "${pid}" 2>/dev/null || true
+      stop_recorder "${pid}"
       rm -f "${PIDFILE}"
       log "cancelled"
       notify "cancelled" 1200

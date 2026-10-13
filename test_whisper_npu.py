@@ -1301,3 +1301,48 @@ def test_control_reply_reflects_the_outcome():
     tool = m.run_tool("grow_control", '{"device":"vivosun","target":"circ","value":"5"}',
                       confirm=lambda q: True)[1]
     assert tool.startswith("Sent, but not confirmed yet:"), tool
+
+
+def test_dictate_stop_waits_for_the_recorder(tmp_path):
+    """Fully faked: no microphone, NPU server or focused window is touched."""
+    import time as _t
+
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    fakes = {
+        # Python, not bash: a job started in the background by a non-interactive
+        # shell inherits SIGINT as ignored, and bash cannot trap that, while a
+        # real recorder (and Python) can still install its own handler.
+        "pw-record": f"#!{sys.executable}\n"
+                     "import signal, sys, time\n"
+                     "out = sys.argv[-1]\n"
+                     "open(out, 'wb').write(b'RIFF')\n"
+                     "def stop(*_):\n"
+                     "    time.sleep(0.5)\n"
+                     "    open(out, 'ab').write(b'END')\n"
+                     "    sys.exit(0)\n"
+                     "signal.signal(signal.SIGINT, stop)\n"
+                     "signal.signal(signal.SIGTERM, stop)\n"
+                     "while True:\n"
+                     "    time.sleep(0.05)\n",
+        "ffmpeg": '#!/bin/bash\nwhile [ "$1" != "-i" ]; do shift; done\nsrc="$2"\n'
+                  'cp "$src" "${@: -1}"\n',
+        "npu-vad": "#!/bin/sh\necho unavailable\nexit 2\n",
+        "whisper-npu": "#!/bin/sh\nexit 1\n",
+        "wtype": "#!/bin/sh\nexit 0\n",
+        "wl-copy": "#!/bin/sh\nexit 0\n",
+        "notify-send": "#!/bin/sh\nexit 0\n",
+    }
+    for name, body in fakes.items():
+        f = bin_ / name
+        f.write_text(body)
+        f.chmod(0o755)
+    run = tmp_path / "run"
+    run.mkdir()
+    env = {"HOME": str(tmp_path), "PATH": f"{bin_}:/usr/bin:/bin",
+           "XDG_RUNTIME_DIR": str(run), "XDG_STATE_HOME": str(tmp_path / "state"),
+           "FLM_PORT": "9"}
+    subprocess.run(["bash", "npu-dictate", "--no-notify", "start"], env=env, timeout=30)
+    _t.sleep(0.3)
+    subprocess.run(["bash", "npu-dictate", "--no-notify", "stop"], env=env, timeout=30)
+    assert (run / "npu-dictate" / "rec.wav").read_bytes().endswith(b"END")
