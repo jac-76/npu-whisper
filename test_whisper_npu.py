@@ -1364,3 +1364,68 @@ def test_cleanup_handlers_installed_even_when_a_thread_creates_the_dir():
         for s, h in saved.items():
             sg.signal(s, h)
         shutil.rmtree(m._SESSION_DIR or "", ignore_errors=True)
+
+
+def _flm_env(tmp_path, flm_body):
+    """A temp state dir, port 9 and a fake `flm` first on PATH, so the real
+    pidfile and server are never touched."""
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    flm = bin_ / "flm"
+    flm.write_text(flm_body)
+    flm.chmod(0o755)
+    env = {**os.environ, "XDG_STATE_HOME": str(tmp_path / "state"), "FLM_PORT": "9",
+           "PATH": f"{bin_}:{os.environ['PATH']}"}
+    assert shutil.which("flm", path=env["PATH"]) == str(flm)
+    pidfile = tmp_path / "state" / "flm" / "flm-server.pid"
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    return env, flm, pidfile
+
+
+def test_stop_does_not_kill_an_unrelated_process(tmp_path):
+    env, _, pidfile = _flm_env(tmp_path, "#!/bin/sh\nexit 1\n")
+    victim = subprocess.Popen(["sleep", "30"])
+    try:
+        pidfile.write_text(str(victim.pid))
+        r = subprocess.run(["bash", "whisper-npu", "--stop"], env=env, capture_output=True,
+                           text=True, timeout=30)
+        assert victim.poll() is None
+        assert not pidfile.exists()
+        assert "server not running" in r.stdout
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_stop_kills_flm_serve(tmp_path):
+    import threading
+    env, flm, pidfile = _flm_env(tmp_path, f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+    proc = subprocess.Popen([str(flm), "serve"])
+    threading.Thread(target=proc.wait, daemon=True).start()  # reap it, no zombie
+    try:
+        pidfile.write_text(str(proc.pid))
+        r = subprocess.run(["bash", "whisper-npu", "--stop"], env=env, capture_output=True,
+                           text=True, timeout=30)
+        assert r.returncode == 0
+        assert "server stopped" in r.stdout
+        for _ in range(150):
+            if proc.poll() is not None:
+                break
+            import time as _t
+            _t.sleep(0.1)
+        assert proc.poll() is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_start_reports_an_early_exit(tmp_path):
+    import time as _t
+    env, _, pidfile = _flm_env(tmp_path, "#!/bin/sh\nexit 1\n")
+    started = _t.monotonic()
+    r = subprocess.run(["bash", "whisper-npu", "--start"], env=env, capture_output=True,
+                       text=True, timeout=30)
+    assert r.returncode != 0
+    assert _t.monotonic() - started < 10
+    assert "exited" in r.stderr + r.stdout
+    assert not pidfile.exists()

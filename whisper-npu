@@ -6,6 +6,7 @@ URL="http://127.0.0.1:${PORT}"
 LOGDIR="${XDG_STATE_HOME:-$HOME/.local/state}/flm"
 LOGFILE="${LOGDIR}/flm-server.log"
 PIDFILE="${LOGDIR}/flm-server.pid"
+LOCKFILE="${LOGDIR}/flm-server.lock"   # the same lock local-ai-assistant takes
 MODEL="${FLM_ASR_MODEL:-whisper-v3}"
 JSON=0
 WAIT_MAX=90
@@ -44,31 +45,85 @@ server_up() {
   curl -s --max-time 2 "${URL}/v1/models" >/dev/null 2>&1
 }
 
+flm_pid() {
+  # Shared with local-ai-assistant: accept the PID only while it is a live
+  # `flm serve` (argv[0] or, for a shebang script, argv[1] is flm). Anything
+  # else is stale, so drop the file rather than signal a stranger.
+  # No pipes here: under pipefail, `printf | grep -q` can fail on SIGPIPE.
+  local pid a0 a1 arg serve=0
+  local -a argv=()
+  [[ -f "${PIDFILE}" ]] || return 1
+  pid=$(cat "${PIDFILE}" 2>/dev/null) || pid=""
+  if [[ "${pid}" =~ ^[0-9]+$ ]] && [[ -r "/proc/${pid}/cmdline" ]]; then
+    mapfile -d '' -t argv < "/proc/${pid}/cmdline"
+    a0="${argv[0]:-}"; a1="${argv[1]:-}"
+    for arg in "${argv[@]}"; do
+      if [[ "${arg}" == serve ]]; then serve=1; fi
+    done
+    if [[ "${a0##*/}" == flm || "${a1##*/}" == flm ]] && ((serve)); then
+      printf '%s\n' "${pid}"
+      return 0
+    fi
+  fi
+  rm -f "${PIDFILE}"
+  return 1
+}
+
 start_server() {
+  # Under the shared lock, so two starters never run two servers on one port
+  # (the second used to orphan the first and overwrite its pidfile).
+  local pid
   mkdir -p "${LOGDIR}"
+  exec 9>"${LOCKFILE}"
+  flock 9
   if server_up; then
     msg "server already running on ${URL}"
+    exec 9>&-
     return 0
   fi
-  msg "starting flm ASR server (loading whisper-v3:turbo)..."
-  nohup flm serve --asr 1 --host 127.0.0.1 >"${LOGFILE}" 2>&1 &
-  echo $! >"${PIDFILE}"
+  if pid=$(flm_pid); then
+    msg "flm serve (pid ${pid}) is still starting; waiting for it..."
+  else
+    msg "starting flm ASR server (loading whisper-v3:turbo)..."
+    nohup flm serve --asr 1 --host 127.0.0.1 >"${LOGFILE}" 2>&1 &
+    pid=$!
+    echo "${pid}" >"${PIDFILE}"
+  fi
   for _ in $(seq 1 "${WAIT_MAX}"); do
     if server_up; then
       msg "server ready on ${URL}"
+      exec 9>&-
       return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      rm -f "${PIDFILE}"
+      msg "ERROR: flm serve exited during start-up; see ${LOGFILE}" >&2
+      exec 9>&-
+      return 1
     fi
     sleep 1
   done
-  msg "ERROR: server failed to start; see ${LOGFILE}" >&2
+  # Left running: the next start adopts it instead of starting a second one.
+  msg "ERROR: flm serve (pid ${pid}) not ready after ${WAIT_MAX}s - it may still be loading;" \
+    "run again to keep waiting, or whisper-npu --stop. Log: ${LOGFILE}" >&2
+  exec 9>&-
   return 1
 }
 
 stop_server() {
-  if [[ -f "${PIDFILE}" ]]; then
-    kill "$(cat "${PIDFILE}")" 2>/dev/null || true
-    rm -f "${PIDFILE}"
-    msg "server stopped"
+  local pid i
+  if pid=$(flm_pid); then
+    kill "${pid}" 2>/dev/null || true
+    for ((i = 0; i < 30; i++)); do
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        rm -f "${PIDFILE}"
+        msg "server stopped"
+        return 0
+      fi
+      sleep 0.5
+    done
+    msg "flm serve (pid ${pid}) did not exit within 15s" >&2
+    return 1
   elif server_up; then
     msg "server running without pidfile; kill manually (pgrep -f 'flm serve')"
   else
@@ -108,7 +163,7 @@ while (($#)); do
     -h|--help) usage; exit 0 ;;
     --status) server_up && echo "server up on ${URL}" || echo "server down"; exit 0 ;;
     --start) start_server; exit $? ;;
-    --stop) stop_server; exit 0 ;;
+    --stop) stop_server; exit $? ;;
     --) shift; while (($#)); do FILES+=("$1"); shift; done ;;
     -*) printf 'error: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     *) FILES+=("$1") ;;
