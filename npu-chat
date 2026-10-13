@@ -508,6 +508,20 @@ def control_intent(text: str) -> bool:
     return is_control_request(text) and bool(_CONTROL_NOUN.search(text))
 
 
+def nothing_changed_note(user_text: str, reply: str, used: list, tools_on: bool) -> str | None:
+    """The correction for a reply to a control request when nothing ran: the
+    model may well have claimed "I've set it to 5". In every LLM mode, not
+    only with tools on -- the default NPU model cannot run grow control at
+    all, and said "Done" anyway."""
+    if not reply or not control_intent(user_text):
+        return None
+    if any(u.get("name") == "grow_control" for u in used):
+        return None
+    if tools_on:
+        return "! nothing was changed - say it as 'set the circulation fan to 5'"
+    return "! nothing was changed - grow control needs an ollama --llm-url with tools on"
+
+
 def handle_control(parsed: tuple[str, str, str], confirm) -> tuple[str, dict]:
     """Validate, confirm and run a parsed control request. Returns the reply
     and a log entry. The reply is built from what actually happened."""
@@ -2259,12 +2273,9 @@ def main() -> int:
             # Reads speaker/speaking when called, so /voice and /speak apply.
             confirm=lambda q: confirm_action(q, speaker, speaking))
         total = time.time() - t_turn
-        if (tools_on and reply and control_intent(user_text)
-                and not any(u["name"] == "grow_control" for u in used)):
-            # The model has claimed "I'll set it to 5 right now" without doing
-            # anything. Whatever it said, say what actually happened.
-            print(f"{YELLOW}! nothing was changed - say it as "
-                  f"'set the circulation fan to 5'{RESET}")
+        note = nothing_changed_note(user_text, reply, used, tools_on)
+        if note:
+            print(f"{YELLOW}{note}{RESET}")
             if voiced:
                 speaker.feed(" Nothing was changed. ")
         first_audio = None

@@ -1200,3 +1200,14 @@ def test_vad_runtime_error_turns_the_gate_off(tmp_path):
     wav = tmp_path / "a.wav"
     _wav16k(wav, [0] * 16000)
     assert m.vad_peak(str(wav)) is None
+
+
+def test_nothing_changed_note_in_every_mode():
+    m = _load_chat()
+    for tools_on in (True, False):
+        note = m.nothing_changed_note("set the duct fan to 5", "Done, I set it.", [], tools_on)
+        assert "nothing was changed" in note
+    assert m.nothing_changed_note("How high should I set the light?", "About 30 cm.", [],
+                                  True) is None
+    assert m.nothing_changed_note("set the duct fan to 5", "ok",
+                                  [{"name": "grow_control"}], True) is None
