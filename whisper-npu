@@ -35,7 +35,7 @@ EXAMPLES:
   whisper-npu a.ogg b.wav --json
   whisper-npu --status
 
-Perf (this machine, Ryzen AI 9 365 / XDNA2 NPU): 28.5s clip -> 5.4s, RTF ~0.19.
+Perf (this machine, Ryzen AI 9 365 / XDNA2 NPU): 30s clip -> 5.2-5.6s, RTF ~0.17-0.19.
 EOF
 }
 

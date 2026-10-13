@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU baseline for the NPU benchmark: whisper.cpp on the same clip + model.
+"""CPU baseline for the NPU benchmark: whisper.cpp (FP16 large-v3-turbo) on the same clip.
 
 Companion to `bench.py`. Times `whisper-cli` (whisper.cpp) transcribing an audio
 file on the CPU and reads the RAPL energy counters around every run, so the two

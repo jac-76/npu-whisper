@@ -4,17 +4,19 @@
 transcription (`whisper-npu`), push-to-talk dictation into any window
 (`npu-dictate`), and a voice chat whose LLM also runs on the NPU (`npu-chat`).
 All of them drive a [FastFlowLM](https://fastflowlm.com/) server over its
-OpenAI-compatible API, started on demand. Everything runs locally; nothing
-leaves the machine.
+OpenAI-compatible API, started on demand. Everything runs locally. Nothing
+leaves the machine unless you use npu-chat's web search, which sends the
+question to public search engines, or point `--llm-url` at another machine.
 
 Verified on a **MSI Stealth A16 AI+** (AMD Ryzen AI 9 365, XDNA2 NPU, 8 columns)
 under Omarchy/Arch Linux.
 
 ## Why the NPU?
 
-Running Whisper on the NPU keeps the CPU and GPU free and uses far less power than
-CPU transcription. On this hardware a 28.5 s clip transcribes in **~5.4 s
-(RTF ≈ 0.19)** with the LLM-sized `whisper-large-v3-turbo` model.
+Running Whisper on the NPU keeps the CPU and GPU free and uses far less energy than
+CPU transcription. On this hardware a 30 s clip transcribes in **5.2–5.6 s
+(RTF ≈ 0.17–0.19)** with `whisper-large-v3-turbo`, for about **9× less energy
+above idle** than whisper.cpp on the CPU.
 
 ## Requirements (driver stack)
 
@@ -72,9 +74,10 @@ baseline, integrated GPU 10% against 7% idle (that delta is desktop
 compositing), discrete GPU flat at 0%. The transcription work doesn't show up on
 any of them — it's on the NPU.
 
-**CPU baseline:** `bench_cpu.py` runs the *same clip and model* through
-`whisper.cpp` on the CPU under the same RAPL measurement. On this box (16
-threads): ~6.8 s, **~400 J per transcription over idle** — roughly **10× the
+**CPU baseline:** `bench_cpu.py` runs the same clip through `whisper.cpp` on
+the CPU (whisper.cpp's FP16 `large-v3-turbo`; the NPU runs FastFlowLM's
+quantised q4nx build) under the same RAPL measurement. On this box (16
+threads): ~6.5 s, **~410 J per transcription over idle**, about **9× the
 NPU's energy** for a ~25 % slower result. See `bench_cpu.py --help` for setup
 (build whisper.cpp from source; the Arch package's ggml backend is broken).
 
