@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import signal
+import threading
 import subprocess
 import sys
 import tempfile
@@ -857,17 +858,32 @@ def _cleanup_and_die(signum, _frame):
     sys.exit(128 + signum)
 
 
+_HANDLERS_SET = False
+
+
+def _install_cleanup_handlers() -> None:
+    """SIGTERM/SIGHUP/SIGINT clean up the session dir. Only the main thread
+    may install signal handlers: a first session_dir() call from the
+    Speaker's synth thread used to set the dir but install none, and no
+    later call retried, so closing the terminal left /tmp/npu-chat-* behind."""
+    global _HANDLERS_SET
+    if _HANDLERS_SET or threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        try:
+            signal.signal(sig, _cleanup_and_die)
+        except (ValueError, OSError):
+            pass
+    _HANDLERS_SET = True
+
+
 def session_dir() -> str:
     """One temp dir per run, removed at exit, instead of one per turn."""
     global _SESSION_DIR
     if _SESSION_DIR is None:
         _SESSION_DIR = tempfile.mkdtemp(prefix="npu-chat-")
         atexit.register(_cleanup)
-        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-            try:
-                signal.signal(sig, _cleanup_and_die)
-            except (ValueError, OSError):
-                pass
+    _install_cleanup_handlers()
     return _SESSION_DIR
 
 
@@ -2152,6 +2168,7 @@ def main() -> int:
         prewarm(LLM_URL, model, llm_server)
     if not ensure_server():
         return 1
+    session_dir()  # on the main thread, before any Speaker or harness thread exists
 
     voice_path = find_voice(args.voice)
     speaking = not args.no_speak

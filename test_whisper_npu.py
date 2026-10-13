@@ -1346,3 +1346,21 @@ def test_dictate_stop_waits_for_the_recorder(tmp_path):
     _t.sleep(0.3)
     subprocess.run(["bash", "npu-dictate", "--no-notify", "stop"], env=env, timeout=30)
     assert (run / "npu-dictate" / "rec.wav").read_bytes().endswith(b"END")
+
+
+def test_cleanup_handlers_installed_even_when_a_thread_creates_the_dir():
+    import signal as sg
+    import threading
+    m = _load_chat()
+    saved = {s: sg.getsignal(s) for s in (sg.SIGTERM, sg.SIGHUP, sg.SIGINT)}
+    try:
+        t = threading.Thread(target=m.session_dir)
+        t.start()
+        t.join()
+        m.session_dir()
+        assert sg.getsignal(sg.SIGTERM) is m._cleanup_and_die
+        assert sg.getsignal(sg.SIGHUP) is m._cleanup_and_die
+    finally:
+        for s, h in saved.items():
+            sg.signal(s, h)
+        shutil.rmtree(m._SESSION_DIR or "", ignore_errors=True)
