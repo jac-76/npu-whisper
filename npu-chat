@@ -588,8 +588,26 @@ def handle_control(parsed: tuple[str, str, str], confirm) -> tuple[str, dict]:
     result = run_control(argv)
     entry["result"] = result
     if result.startswith("done"):
-        return f"Done. {result[len('done: '):]}.", entry
+        return control_outcome(result), entry
     return f"That did not work: {result}. It may not have changed.", entry
+
+
+def control_outcome(result: str) -> str:
+    """What a successful CLI run actually did, in words: exit 0 also covers
+    "already at 3/10; nothing changed" and "accepted by the cloud, but the
+    controller had not reported it within 12s", which were both "Done."
+    A result that does not start with "done" is returned unchanged."""
+    if not result.startswith("done"):
+        return result
+    out = result[len("done:"):].strip().rstrip(".")
+    low = out.lower()
+    if not out:
+        return "Done."
+    if "nothing changed" in low:
+        return f"Nothing needed changing: {out}."
+    if "had not reported" in low or "unconfirmed" in low:
+        return f"Sent, but not confirmed yet: {out}."
+    return f"Done. {out}."
 
 
 def run_control(argv: list[str]) -> str:
@@ -636,7 +654,8 @@ def run_tool(name: str, raw_args: str, found: list | None = None,
             return args, f"not allowed: {exc}. Nothing was changed."
         if confirm is None or not confirm(question):
             return args, "The user cancelled. Nothing was changed."
-        return args, run_control(argv)
+        # The model is told in the same words the user hears on the parsed path.
+        return args, control_outcome(run_control(argv))
     return args, f"unknown tool {name}"
 
 

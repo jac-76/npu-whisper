@@ -1044,7 +1044,7 @@ def test_grow_control_never_runs_without_a_yes(tmp_path):
             confirm=lambda q: True)[1]
         assert not log.exists()
         out = m.run_tool("grow_control", raw, confirm=lambda q: True)[1]
-        assert out == "done: circ fan -> 5/10 confirmed"
+        assert out == "Done. circ fan -> 5/10 confirmed."  # control_outcome wording
         assert log.read_text().strip() == "vivosun set circ 5"
     finally:
         os.environ["PATH"] = old
@@ -1277,3 +1277,27 @@ def test_grow_questions_are_not_web_searched():
         assert len(queries) == 1
     finally:
         srv.shutdown()
+
+
+def test_control_reply_reflects_the_outcome():
+    m = _load_chat()
+    m._cached_tooltip = lambda c: ""
+    unconfirmed = ("done: circ fan -> 5/10 sent and accepted by the cloud, but the controller "
+                   "had not reported it within 12s")
+    cases = [
+        ("done: ", lambda r: r == "Done."),
+        ("done: circ fan was already at 5/10 in manual mode; nothing changed",
+         lambda r: r.startswith("Nothing needed changing:")),
+        (unconfirmed, lambda r: r.startswith("Sent, but not confirmed yet:")),
+        ("done: circ fan -> 5/10 (controller confirmed)",
+         lambda r: r == "Done. circ fan -> 5/10 (controller confirmed)."),
+    ]
+    for result, ok in cases:
+        m.run_control = lambda argv, result=result: result
+        reply, _ = m.handle_control(("vivosun", "circ", "5"), lambda q: True)
+        assert ok(reply), reply
+        assert ". ." not in reply
+    m.run_control = lambda argv: unconfirmed
+    tool = m.run_tool("grow_control", '{"device":"vivosun","target":"circ","value":"5"}',
+                      confirm=lambda q: True)[1]
+    assert tool.startswith("Sent, but not confirmed yet:"), tool
