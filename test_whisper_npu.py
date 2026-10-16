@@ -594,6 +594,124 @@ def test_speaker_stop_silences_and_drops_the_queue(tmp_path):
     assert log.read_text().strip().split("\n")[-1] == "After barge-in."
 
 
+FAKE_KOKORO = """
+import json, sys
+open(sys.argv[0] + ".starts", "a").write(sys.argv[-1] + "\\n")
+print("ready", flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    open(req["wav"], "w").write(req["text"])
+    print("ok", flush=True)
+"""
+
+
+def _kokoro_in(m, tmp_path, worker_src):
+    """Point npu-chat at a fake Kokoro install: the venv's python is this
+    Python, the voices file has two English voices and a Japanese one."""
+    import zipfile
+
+    d = tmp_path / "kokoro"
+    (d / "venv" / "bin").mkdir(parents=True)
+    os.symlink(sys.executable, d / "venv" / "bin" / "python")
+    (d / "kokoro-v1.0.onnx").write_bytes(b"model")
+    with zipfile.ZipFile(d / "voices-v1.0.bin", "w") as z:
+        for name in ("af_heart", "bm_george", "jf_alpha"):
+            z.writestr(name + ".npy", b"")
+    worker = tmp_path / "npu-kokoro"
+    worker.write_text(worker_src)
+    m.KOKORO_DIR, m.KOKORO_WORKER = str(d), str(worker)
+    return d
+
+
+def test_kokoro_voices_resolve_only_when_installed(tmp_path):
+    m = _chat_in(tmp_path)
+    d = _kokoro_in(m, tmp_path, FAKE_KOKORO)
+    assert m.find_voice("kokoro:af_heart") == "kokoro:af_heart"
+    assert m.find_voice("kokoro:af_nobody") is None
+    assert "kokoro:bm_george" in m.available_voices()
+    assert "kokoro:jf_alpha" not in m.available_voices()     # not English
+    assert m.voice_label("kokoro:af_heart") == "kokoro:af_heart"
+    assert m.voice_label("/v/en_GB-cori-high.onnx") == "en_GB-cori-high"
+    (d / "kokoro-v1.0.onnx").unlink()
+    assert m.find_voice("kokoro:af_heart") is None
+
+
+def test_speaker_keeps_one_kokoro_process_for_every_sentence(tmp_path):
+    """Kokoro loads in about 0.4 s, so it must not restart per sentence."""
+    m = _chat_in(tmp_path)
+    _kokoro_in(m, tmp_path, FAKE_KOKORO)
+    log = tmp_path / "played.txt"
+    player = [sys.executable, "-c",
+              "import sys; open(sys.argv[1],'a').write(open(sys.argv[2]).read()+'\\n')",
+              str(log)]
+    sp = m.Speaker("kokoro:af_heart", player=player)
+    sp.say("One. Two. Three.")
+    sp.wait_idle(10)
+    assert log.read_text().split("\n")[:3] == ["One.", "Two.", "Three."]
+    assert (tmp_path / "npu-kokoro.starts").read_text() == "af_heart\n"
+    sp.set_voice("kokoro:bm_george")
+    sp.say("Four.")
+    sp.wait_idle(10)
+    assert log.read_text().split("\n")[3] == "Four."
+    assert (tmp_path / "npu-kokoro.starts").read_text() == "af_heart\nbm_george\n"
+
+
+def test_kokoro_that_will_not_start_mutes_instead_of_hanging(tmp_path, capsys):
+    import time
+
+    m = _chat_in(tmp_path)
+    _kokoro_in(m, tmp_path, 'print("error: No module named kokoro_onnx", flush=True)\n')
+    sp = m.Speaker("kokoro:af_heart", player=["true"])
+    sp.say("Nobody hears this.")
+    t0 = time.time()
+    sp.wait_idle(10)
+    assert time.time() - t0 < 5
+    assert ("kokoro af_heart did not start (error: No module named kokoro_onnx)"
+            in capsys.readouterr().out)
+
+
+def test_kokoro_process_is_out_of_reach_of_ctrl_c(tmp_path):
+    """Ctrl+C cancels a turn, and the terminal sends SIGINT to its whole
+    foreground process group: npu-kokoro must not be in it, or the first
+    Ctrl+C would leave the rest of the session silent."""
+    m = _chat_in(tmp_path)
+    _kokoro_in(m, tmp_path, "import os, sys\n"
+               "open(sys.argv[0] + '.pgrp', 'w').write(str(os.getpgrp()))\n"
+               "print('ready', flush=True)\n"
+               "sys.stdin.read()\n")
+    synth = m._kokoro_synth_factory("af_heart")
+    try:
+        assert int((tmp_path / "npu-kokoro.pgrp").read_text()) != os.getpgrp()
+    finally:
+        synth.close()
+
+
+def test_self_facts_names_the_kokoro_voice():
+    m = _load_chat()
+    s = m.self_facts("x", "kokoro:af_heart")
+    assert "your voice is kokoro af_heart, which runs on the CPU" in s
+    assert "piper" not in s
+
+
+def test_real_kokoro_writes_speech(tmp_path):
+    """The real npu-kokoro against the installed model; skipped without it."""
+    import pytest
+    import wave
+
+    m = _chat_in(tmp_path)
+    if "af_heart" not in m.kokoro_voices():
+        pytest.skip(f"Kokoro is not installed in {m.KOKORO_DIR}")
+    synth = m._kokoro_synth_factory("af_heart")
+    wav = str(tmp_path / "s.wav")
+    try:
+        assert synth("Hello there.", wav)
+    finally:
+        synth.close()
+    with wave.open(wav) as w:
+        assert w.getframerate() == 24000
+        assert w.getnframes() > 0.3 * 24000
+
+
 def test_confirm_flag_exists_for_chat_mode():
     out = subprocess.run([sys.executable, "npu-chat", "--help"],
                          capture_output=True, text=True, check=True)

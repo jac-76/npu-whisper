@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+import zipfile
 
 PORT = int(os.environ.get("FLM_PORT", "52625"))
 URL = f"http://127.0.0.1:{PORT}"
@@ -69,6 +70,14 @@ VOICE_DIRS = (
     os.path.expanduser("~/.local/share/piper"),
     os.path.expanduser("~/.local/share/piper-voices"),
 )
+# Kokoro voices (kokoro:af_heart) are spoken by npu-kokoro, installed next to
+# npu-chat, running under KOKORO_DIR/venv: kokoro-onnx does not install on the
+# system Python (3.14). The model and voices file sit beside that venv.
+KOKORO_DIR = os.path.expanduser(
+    os.environ.get("NPU_CHAT_KOKORO_DIR", "~/.local/share/kokoro"))
+KOKORO_WORKER = os.path.join(
+    os.path.dirname(os.path.realpath(globals().get("__file__", "npu-chat"))),
+    "npu-kokoro")
 
 SYSTEM_PROMPT = (
     "You are a helpful voice assistant running locally on a laptop NPU. "
@@ -856,7 +865,9 @@ def self_facts(model: str, voice: str | None, llm_on_npu: bool = True,
             "speech recognition is whisper-large-v3-turbo running on this "
             "laptop's AMD Ryzen AI 9 365 (XDNA2) NPU",
         ]
-    if voice:
+    if voice and voice.startswith("kokoro:"):
+        bits.append(f"your voice is kokoro {voice[len('kokoro:'):]}, which runs on the CPU")
+    elif voice:
         bits.append(f"your voice is piper {voice}, which runs on the CPU")
     else:
         bits.append("you are not speaking out loud right now, replies are text only")
@@ -1268,8 +1279,31 @@ def stream_reply(model: str, history: list[dict], server: str | None = None,
     return reply, first, total
 
 
+def kokoro_voices() -> list[str]:
+    """The English Kokoro voices, or none when Kokoro is not installed."""
+    needed = (os.path.join(KOKORO_DIR, "venv", "bin", "python"),
+              os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx"), KOKORO_WORKER)
+    if not all(os.path.exists(p) for p in needed):
+        return []
+    try:
+        with zipfile.ZipFile(os.path.join(KOKORO_DIR, "voices-v1.0.bin")) as z:
+            names = [n[:-4] for n in z.namelist() if n.endswith(".npy")]
+    except (OSError, zipfile.BadZipFile):
+        return []
+    # a = American, b = British English; the other letters are other languages
+    return sorted(n for n in names if n[:1] in ("a", "b"))
+
+
+def voice_label(voice: str) -> str:
+    """The id a resolved voice goes by: en_GB-cori-high, kokoro:af_heart."""
+    return voice if voice.startswith("kokoro:") else os.path.basename(voice)[:-5]
+
+
 def find_voice(name: str) -> str | None:
-    """Resolve a piper voice id (or path) to an .onnx on disk."""
+    """Resolve a piper voice id (or path) to an .onnx on disk, or a
+    kokoro:NAME id to itself when that Kokoro voice is installed."""
+    if name.startswith("kokoro:"):
+        return name if name[len("kokoro:"):] in kokoro_voices() else None
     if os.path.sep in name:
         return name if os.path.exists(name) else None
     if name.endswith(".onnx") and os.path.exists(name):
@@ -1290,7 +1324,7 @@ def available_voices() -> list[str]:
         for f in sorted(os.listdir(d)):
             if f.endswith(".onnx") and f[:-5] not in seen:
                 seen.append(f[:-5])
-    return seen
+    return seen + ["kokoro:" + n for n in kokoro_voices()]
 
 
 def tts_ready() -> bool:
@@ -1384,6 +1418,54 @@ def _piper_synth_factory(voice_path: str):
     return inproc
 
 
+def _kokoro_synth_factory(name: str):
+    """Start npu-kokoro once and keep it, so the model loads once: one JSON
+    line per sentence in, "ok" back when the WAV is written. Never raises
+    (Speaker would wait on it): if Kokoro will not start, replies are shown
+    but not spoken."""
+    cmd = [os.path.join(KOKORO_DIR, "venv", "bin", "python"), "-I", KOKORO_WORKER,
+           os.path.join(KOKORO_DIR, "kokoro-v1.0.onnx"),
+           os.path.join(KOKORO_DIR, "voices-v1.0.bin"), name]
+    proc = None
+    try:
+        # Its own session: Ctrl+C cancels a turn here, and the terminal sends it
+        # to the whole foreground group, which would kill npu-kokoro too.
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True,
+                                start_new_session=True)
+        status = proc.stdout.readline().strip()
+    except OSError as exc:
+        status = str(exc)
+    if status != "ready":
+        if proc is not None:
+            proc.kill()
+        print(f"\n{YELLOW}kokoro {name} did not start ({status or 'no output'}); "
+              f"replies are not spoken.{RESET}")
+        return lambda text, wav: False
+    lock = threading.Lock()
+
+    def synth(text: str, wav: str) -> bool:
+        with lock:
+            proc.stdin.write(json.dumps({"text": text, "wav": wav}) + "\n")
+            proc.stdin.flush()
+            return proc.stdout.readline().strip() == "ok"
+
+    def close() -> None:
+        try:
+            proc.stdin.close()      # npu-kokoro exits at end of input
+        except OSError:
+            pass
+
+    synth.close = close
+    return synth
+
+
+def _synth_factory(voice: str):
+    if voice.startswith("kokoro:"):
+        return _kokoro_synth_factory(voice[len("kokoro:"):])
+    return _piper_synth_factory(voice)
+
+
 class Speaker:
     """Speak a reply while it is still streaming, and stop the moment asked.
 
@@ -1393,7 +1475,7 @@ class Speaker:
     with an older generation is discarded rather than spoken late.
     """
 
-    def __init__(self, voice_path: str, synth_factory=_piper_synth_factory,
+    def __init__(self, voice_path: str, synth_factory=_synth_factory,
                  player: list[str] | None = None) -> None:
         import queue
         import threading
@@ -1424,9 +1506,13 @@ class Speaker:
 
     def set_voice(self, voice_path: str) -> None:
         self.stop()
+        old = self._synth
         self.voice_path = voice_path
         self._synth_ready.clear()
         self._load()
+        close = getattr(old, "close", None)
+        if close:
+            close()                 # the old voice's npu-kokoro process
 
     def begin(self) -> None:
         """Start of a reply: timing for first_audio is measured from here."""
@@ -1530,7 +1616,7 @@ HELP = f"""{BOLD}Commands{RESET}
   {CYAN}/model NAME{RESET}    switch LLM (e.g. /model qwen3:4b)
   {CYAN}/models{RESET}        list models installed on this box
   {CYAN}/speak{RESET}         toggle spoken replies
-  {CYAN}/voice NAME{RESET}    switch voice (e.g. /voice en_US-amy-medium)
+  {CYAN}/voice NAME{RESET}    switch voice (e.g. /voice en_US-amy-medium, /voice kokoro:af_heart)
   {CYAN}/voices{RESET}        list voices installed on this box
   {CYAN}/reset{RESET}         clear the conversation
   {CYAN}/help{RESET}          this list
@@ -1980,7 +2066,7 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
     def meta() -> dict:
         return {"started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "model": model,
-                "voice": (os.path.basename(voice_path)[:-5]
+                "voice": (voice_label(voice_path)
                           if speaking and voice_path else None),
                 "server": f"ASR {URL}, agent claude -> {LLM_URL}, workdir {workdir}"}
 
@@ -1988,7 +2074,7 @@ def harness_loop(args, model: str, workdir: str, voice_path: str | None,
           f"{model} via {LLM_URL}{RESET}")
     print(f"{DIM}workdir {workdir} (git) | allowed: "
           f"{', '.join(harness.allow)}{RESET}")
-    voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
+    voice_note = (f"voice {voice_label(voice_path)}"
                   if speaking and voice_path else "voice off")
     print(f"{DIM}{voice_note} | press Enter to talk, /help for commands{RESET}")
     if transcript:
@@ -2137,7 +2223,8 @@ def main() -> int:
     ap.add_argument("--no-speak", action="store_true",
                     help="do not speak replies (text only)")
     ap.add_argument("--voice", default=DEFAULT_VOICE,
-                    help=f"piper voice id or .onnx path (default {DEFAULT_VOICE})")
+                    help=f"piper voice id or .onnx path, or kokoro:NAME "
+                         f"(default {DEFAULT_VOICE})")
     ap.add_argument("--system", default=SYSTEM_PROMPT, help="override the system prompt")
     ap.add_argument("--llm-url", default=os.environ.get("NPU_CHAT_LLM_URL") or None,
                     help="OpenAI-compatible base URL for the LLM "
@@ -2222,14 +2309,16 @@ def main() -> int:
         print(f"{YELLOW}spoken replies off: {missing} not found.{RESET}")
         speaking = False
     elif speaking and voice_path is None:
+        where = (f"{KOKORO_DIR} (README: Kokoro)" if args.voice.startswith("kokoro:")
+                 else " or ".join(VOICE_DIRS))
         print(f"{YELLOW}spoken replies off: voice {args.voice!r} not found in "
-              f"{' or '.join(VOICE_DIRS)}.{RESET}")
+              f"{where}.{RESET}")
         speaking = False
 
     tools_on = not args.no_tools and llm_server in TOOL_SERVERS
 
     def system_msg() -> dict:
-        voice_id = (os.path.basename(voice_path)[:-5]
+        voice_id = (voice_label(voice_path)
                     if speaking and voice_path else None)
         hint = (TOOLS_HINT.format(today=time.strftime("%A %B %-d, %Y"))
                 if tools_on else "")
@@ -2263,7 +2352,7 @@ def main() -> int:
         return {
             "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "model": model,
-            "voice": (os.path.basename(voice_path)[:-5]
+            "voice": (voice_label(voice_path)
                       if speaking and voice_path else None),
             "server": URL if LLM_URL == URL else f"ASR {URL}, LLM {LLM_URL}",
         }
@@ -2275,7 +2364,7 @@ def main() -> int:
         print(f"{BOLD}npu-chat{RESET} {DIM}- ASR on the NPU via {URL}; "
               f"LLM via {LLM_URL} ({llm_server or 'unknown server'}, "
               f"{llm_where}){RESET}")
-    voice_note = (f"voice {os.path.basename(voice_path)[:-5]}"
+    voice_note = (f"voice {voice_label(voice_path)}"
                   if speaking and voice_path else "voice off")
     tools_note = " | tools: web search, grow status" if tools_on else ""
     print(f"{DIM}model {model} | {voice_note}{tools_note} | press Enter to talk, "
@@ -2341,7 +2430,7 @@ def main() -> int:
                 print(f"{DIM}voices: {', '.join(names) if names else 'none found'}{RESET}")
             elif cmd == "/voice":
                 if not rest:
-                    current = os.path.basename(voice_path)[:-5] if voice_path else "none"
+                    current = voice_label(voice_path) if voice_path else "none"
                     print(f"{DIM}current voice: {current}{RESET}")
                 else:
                     found = find_voice(rest)

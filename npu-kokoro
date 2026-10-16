@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Kokoro speech for npu-chat: npu-kokoro MODEL VOICES VOICE
+
+npu-chat starts this once per Kokoro voice, under the Python that has
+kokoro-onnx (README: Kokoro), and keeps it: the model loads once, then each
+input line is one sentence, {"text": ..., "wav": ...}. The WAV is written and
+"ok" printed, or "error: ..." on failure. Exits at end of input.
+"""
+
+import json
+import sys
+import wave
+
+
+def main(argv: list[str]) -> int:
+    model, voices, name = argv[1:4]
+    lang = "en-gb" if name.startswith("b") else "en-us"   # b = British voices
+    try:
+        import numpy as np
+        from kokoro_onnx import Kokoro
+
+        kokoro = Kokoro(model, voices)
+        # The first call is slower; pay it here, and fail now on a bad voice.
+        kokoro.create("Ready.", voice=name, speed=1.0, lang=lang)
+    except Exception as exc:
+        print(f"error: {exc}", flush=True)
+        return 1
+    print("ready", flush=True)
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+            samples, rate = kokoro.create(req["text"], voice=name, speed=1.0, lang=lang)
+            # piper scales every sentence to full scale and Kokoro does not:
+            # unscaled, it played 6-9 dB quieter than the piper voices.
+            peak = float(np.abs(samples).max()) if len(samples) else 0.0
+            if peak > 1e-6:
+                samples = samples / peak
+            pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+            with wave.open(req["wav"], "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(pcm.tobytes())
+            print("ok", flush=True)
+        except Exception as exc:
+            print(f"error: {exc}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

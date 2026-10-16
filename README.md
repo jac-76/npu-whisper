@@ -93,6 +93,7 @@ install -m755 npu-chat ~/.local/bin/
 npu-chat                             # NPU ASR + NPU LLM + spoken reply
 npu-chat --model qwen3:4b            # pick another LLM
 npu-chat --voice en_US-amy-medium    # pick another voice
+npu-chat --voice kokoro:af_heart     # a Kokoro voice (see Kokoro voices below)
 npu-chat --no-speak                  # text only
 ```
 
@@ -110,7 +111,7 @@ reuses the prefix, reporting e.g. `Matched 8 out of 10 messages (2 new to
 prefill)`, so a long conversation does not re-cost the whole history each turn.
 
 The system prompt states what the assistant actually is — model id, that it runs
-on the NPU under FastFlowLM, the ASR model, and the piper voice — and is rebuilt
+on the NPU under FastFlowLM, the ASR model, and the voice — and is rebuilt
 when `/model`, `/voice` or `/speak` changes it. A 1B model cannot know any of
 that on its own, and "what model are you?" is a natural thing to ask by voice.
 It still garbles the supplied facts sometimes; it is a 1B model.
@@ -526,7 +527,7 @@ came back identical at every threshold tried:
 that would leave less than `NPU_CHAT_MIN_SECS` of audio is discarded and the
 untrimmed clip is used.
 
-### Spoken replies: piper, on the CPU
+### Spoken replies: piper or Kokoro, on the CPU
 
 Replies are spoken by default with [piper](https://github.com/rhasspy/piper)
 (`piper-tts`), voice **`en_GB-alan-medium`**. Voices are looked up in
@@ -561,6 +562,48 @@ generation stay on the NPU.
 
 One trap worth repeating: **never pass `--output-raw` to `piper-tts`.** It
 redirects audio to stdout and leaves `-f` empty, so playback gets silence.
+
+#### Kokoro voices: more natural, about twice piper-high's CPU time
+
+[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M) (82M parameters, Apache 2.0)
+sounds more natural than piper. `--voice kokoro:af_heart` or `/voice kokoro:af_heart`
+picks one, and `/voices` lists the 28 English ones once it is installed (`af_`/`am_`
+American, `bf_`/`bm_` British). Kokoro grades its own voices in its `VOICES.md`;
+`af_heart` is the only A.
+
+`kokoro-onnx` 0.6.1 does not install on Python 3.14, so Kokoro runs in its own
+process, `npu-kokoro`, under a venv of an older Python. npu-chat starts it once per
+voice and keeps it: a sentence in, a WAV out, the model loaded once. It scales each
+sentence to full scale as piper does; unscaled, Kokoro played 6–9 dB quieter than
+the piper voices.
+
+```sh
+install -m755 npu-kokoro ~/.local/bin/      # next to npu-chat
+mkdir -p ~/.local/share/kokoro && cd ~/.local/share/kokoro
+python3.12 -m venv venv && venv/bin/pip install kokoro-onnx==0.6.1
+curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+curl -LO https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+sha256sum kokoro-v1.0.onnx voices-v1.0.bin
+# 7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5  kokoro-v1.0.onnx
+# bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d  voices-v1.0.bin
+```
+
+The release publishes no checksums; these match the copies on Hugging Face
+(`fastrtc/kokoro-onnx`). `NPU_CHAT_KOKORO_DIR` moves the install.
+
+Synthesis per sentence on the Ryzen AI 9 365's CPU (34 / 107 / 135 characters,
+median of 5, 2026-10-16):
+
+| voice | synthesis |
+|---|---|
+| piper `en_GB-alan-medium` | 0.07 / 0.17 / 0.18 s |
+| piper `en_GB-cori-high` | 0.27 / 0.59 / 0.77 s |
+| Kokoro `af_heart` | 0.45 / 1.09 / 1.31 s |
+
+Through npu-chat's speaker, with a three-sentence reply fed at once (first sentence
+83 characters, 3 runs): first audio 0.50–0.56 s with Cori and 0.83–0.91 s with
+`af_heart`, no gap between sentences with either, and the two play at -15.5 and
+-16.5 LUFS.
 
 ### Speech gate: Silero VAD ahead of whisper
 
