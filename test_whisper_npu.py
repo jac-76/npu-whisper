@@ -292,7 +292,7 @@ def test_thinking_disabled_only_for_ollama():
     h = [{"role": "user", "content": "hi"}]
     assert m.request_body("qwen3.5:9b", h, "ollama")["reasoning_effort"] == "none"
     assert "reasoning_effort" not in m.request_body("qwen3.5:4b", h, None)
-    assert "reasoning_effort" not in m.request_body("granite", h, "llama.cpp")
+    assert m.request_body("qwen3.8-27b", h, "llama.cpp")["reasoning_effort"] == "none"
 
 
 # --- voice -> coding agent (--harness claude) --------------------------------

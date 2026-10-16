@@ -171,11 +171,19 @@ llama-server -m granite-4.2-3b-Q4_K_M.gguf --jinja --reasoning off   --host 127.
 npu-chat --llm-url http://127.0.0.1:8080 --model granite
 ```
 
-`--reasoning off` matters: granite 4.2 is a reasoning model and llama.cpp
+Thinking has to be off: granite 4.2 is a reasoning model and llama.cpp
 preserves thinking by default, which spent an entire 200-token budget on
 `reasoning_content` and returned `finish_reason: length` with empty `content`.
 With it off the answer comes straight back, and tool calls got faster too
-(1.39 s → 0.40 s).
+(1.39 s → 0.40 s). npu-chat now asks for that per request
+(`reasoning_effort: "none"`, which llama-server honours), so `--reasoning off`
+is optional. Leaving it out lets a server shared with a chat page keep thinking
+on there. llama-server also gets the tools (web search, grow status), like ollama.
+
+Qwen 3.8 27B split over the desktop 3060 Ti + this laptop's 4070 (llama.cpp
+RPC, `~/Work/llm-split`) through npu-chat, measured 2026-10-16, text-only:
+first token 2.9–5.7 s, with the search and grow-status turns correct. With
+thinking on, the first token took 5.8 s, then 12.7 s, then 28.4 s.
 
 Measured on this box, same prompt, warm:
 

@@ -85,12 +85,14 @@ def llm_where_default(llm_url: str) -> str:
     return f"a separate machine at {host}"
 
 
-# --- tools the chat model can call (ollama only) ------------------------------
-# qwen3.5 on ollama returned real tool calls in every probe; FastFlowLM's
-# gemma3:1b ignored them and invented results, so tools are offered only to
-# ollama. Web search goes to a local SearXNG; grow status reads the snapshots
-# the grow daemons already cache (`<tool> bar`), never polling the cloud APIs:
-# AC Infinity answers extra polling with 403.
+# --- tools the chat model can call (ollama, llama-server) ---------------------
+# qwen3.5 on ollama returned real tool calls in every probe, and so did
+# llama-server (granite 4.2, Qwen 3.8 27B); FastFlowLM's gemma3:1b ignored them
+# and invented results, so FastFlowLM gets no tools. Web search goes to a
+# local SearXNG; grow status reads the snapshots the grow daemons already
+# cache (`<tool> bar`), never polling the cloud APIs: AC Infinity answers extra
+# polling with 403.
+TOOL_SERVERS = ("ollama", "llama.cpp")
 
 SEARX_URL = os.environ.get("NPU_CHAT_SEARX_URL", "http://127.0.0.1:8888")
 MAX_TOOL_ROUNDS = 3
@@ -577,7 +579,7 @@ def nothing_changed_note(user_text: str, reply: str, used: list, tools_on: bool)
         return None
     if tools_on:
         return "! nothing was changed - say it as 'set the circulation fan to 5'"
-    return "! nothing was changed - grow control needs an ollama --llm-url with tools on"
+    return "! nothing was changed - grow control needs an ollama or llama-server --llm-url with tools on"
 
 
 def handle_control(parsed: tuple[str, str, str], confirm) -> tuple[str, dict]:
@@ -1154,11 +1156,13 @@ def transcribe(path: str) -> str:
 
 def request_body(model: str, history: list[dict], server: str | None) -> dict:
     body = {"model": model, "messages": history, "max_tokens": 512, "stream": True}
-    if server == "ollama":
+    if server in ("ollama", "llama.cpp"):
         # Qwen3.5 on ollama thinks by default and spent the whole 512-token
         # budget on it: empty content, finish_reason=length, 5/5 word problems
         # "unanswered". Measured: reasoning_effort="none" gives 0 reasoning
         # chars; think:false and chat_template_kwargs are ignored on /v1.
+        # llama-server honours it too (Qwen 3.8 27B, 0 reasoning chars), so a
+        # server shared with a chat page can keep thinking on for the page.
         body["reasoning_effort"] = "none"
     return body
 
@@ -2124,7 +2128,7 @@ def main() -> int:
                          "else 'this laptop' or 'a separate machine at HOST')")
     ap.add_argument("--no-tools", action="store_true",
                     help="do not offer the model web search or grow status "
-                         "(tools are only offered to ollama servers)")
+                         "(tools are only offered to ollama and llama-server)")
     ap.add_argument("--resume", action="store_true",
                     help="continue the most recent chat session from its transcript")
     ap.add_argument("--confirm", action="store_true",
@@ -2200,7 +2204,7 @@ def main() -> int:
               f"{' or '.join(VOICE_DIRS)}.{RESET}")
         speaking = False
 
-    tools_on = not args.no_tools and llm_server == "ollama"
+    tools_on = not args.no_tools and llm_server in TOOL_SERVERS
 
     def system_msg() -> dict:
         voice_id = (os.path.basename(voice_path)[:-5]
