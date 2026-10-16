@@ -96,6 +96,14 @@ TOOL_SERVERS = ("ollama", "llama.cpp")
 
 SEARX_URL = os.environ.get("NPU_CHAT_SEARX_URL", "http://127.0.0.1:8888")
 MAX_TOOL_ROUNDS = 3
+# The last round offers no tools. Qwen 3.8 on llama-server kept searching
+# anyway and wrote the call out as text ("<tool_call> <function=web_search>
+# ..."), which was printed and spoken as the answer. So that round is told to
+# answer, and is held back until any leftover call markup is stripped.
+ANSWER_NOW = {"role": "user", "content": (
+    "(No more searches are available. Answer now from the results above; if "
+    "they do not say, tell me you could not find it.)")}
+TOOL_MARKUP = re.compile(r"<tool_call>.*?(?:</tool_call>|$)", re.S)
 GROW_TOOLS = (("acinf", "AC Infinity controller"),
               ("vivosun", "VIVOSUN GrowHub"),
               ("yinmik", "YINMIK reservoir meter"))
@@ -752,10 +760,12 @@ def chat_turn(model: str, history: list[dict], user_text: str,
     reply = ""
     for round_ in range(MAX_TOOL_ROUNDS + 1):
         calls: list[dict] = []
-        offer = tools_for() if tools_on and round_ < MAX_TOOL_ROUNDS else None
+        out_of_rounds = tools_on and round_ == MAX_TOOL_ROUNDS
+        offer = tools_for() if tools_on and not out_of_rounds else None
         t_round = time.time()
-        reply, r_ttft, _ = stream_reply(model, history, server, on_delta=on_delta,
-                                        tools=offer, calls_out=calls)
+        reply, r_ttft, _ = stream_reply(model, history + [ANSWER_NOW] if out_of_rounds else history,
+                                        server, on_delta=on_delta, tools=offer,
+                                        calls_out=calls, hold=out_of_rounds)
         if r_ttft is not None and ttft is None:
             ttft = (t_round - t_turn) + r_ttft
         if not calls:
@@ -1169,8 +1179,12 @@ def request_body(model: str, history: list[dict], server: str | None) -> dict:
 
 def stream_reply(model: str, history: list[dict], server: str | None = None,
                  on_delta=None, tools: list[dict] | None = None,
-                 calls_out: list | None = None) -> tuple[str, float | None, float]:
+                 calls_out: list | None = None,
+                 hold: bool = False) -> tuple[str, float | None, float]:
     """Stream a chat completion, printing tokens as they arrive.
+
+    With `hold`, nothing is printed or passed on until the reply is complete;
+    then tool-call markup written as text is stripped first.
 
     on_delta gets each piece of text too, so speech can start on the first
     sentence instead of waiting for the whole reply. With `tools`, any tool
@@ -1218,10 +1232,12 @@ def stream_reply(model: str, history: list[dict], server: str | None = None,
                     continue
                 if first is None:
                     first = time.time() - start
+                out.append(delta)
+                if hold:
+                    continue
                 if not labelled:
                     print(f"{GREEN}{BOLD}npu{RESET} ", end="", flush=True)
                     labelled = True
-                out.append(delta)
                 sys.stdout.write(delta)
                 sys.stdout.flush()
                 if on_delta:
@@ -1233,6 +1249,12 @@ def stream_reply(model: str, history: list[dict], server: str | None = None,
                   f"to use the NPU.{RESET}")
         return "", None, time.time() - start
     reply = "".join(out).strip()
+    if hold:
+        reply = TOOL_MARKUP.sub("", reply).strip()
+        if reply:
+            print(f"{GREEN}{BOLD}npu{RESET} {reply}", end="", flush=True)
+            if on_delta:
+                on_delta(reply)
     total = time.time() - start
     if calls_out is not None:
         calls_out.extend(partial[i] for i in sorted(partial))

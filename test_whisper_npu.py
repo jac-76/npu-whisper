@@ -832,6 +832,44 @@ def test_chat_turn_runs_a_tool_round():
         srv.shutdown()
 
 
+def test_chat_turn_answers_when_out_of_tool_rounds():
+    """Qwen 3.8 on llama-server (2026-10-16) kept searching; once tools were no
+    longer offered it wrote the call as text, and npu-chat printed and spoke
+    '<tool_call> <function=web_search> ...' as the answer."""
+    m = _load_chat()
+    seen = []
+    raw = ("<tool_call>\n<function=web_search>\n<parameter=query>\nalan xtra\n"
+           "</parameter>\n</function>\n</tool_call>")
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            return "application/json", json.dumps(
+                {"results": [{"title": "piper voices", "url": "https://p", "content": "alan: low, medium"}]}).encode()
+        seen.append(body)
+        if "tools" in body:
+            return _sse({"choices": [{"delta": {"tool_calls": [
+                {"id": f"c{len(seen)}", "index": 0, "function": {"name": "web_search",
+                                                                "arguments": '{"query":"alan xtra"}'}}]}}]})
+        return _sse({"choices": [{"delta": {"content": "Alan comes in low and medium. " + raw}}]})
+
+    base, srv = _post_stub(handler)
+    spoken = []
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        hist = [{"role": "system", "content": "s"}]
+        reply, _, used, _ = m.chat_turn("m", hist, "Is there an extra version of the alan voice?",
+                                        "llama.cpp", True, on_delta=spoken.append,
+                                        log=lambda *a: None)
+        assert len(seen) == m.MAX_TOOL_ROUNDS + 1 and "tools" not in seen[-1]
+        assert "answer now" in seen[-1]["messages"][-1]["content"].lower()
+        assert reply == "Alan comes in low and medium."
+        assert "<tool_call>" not in "".join(spoken)
+        assert "answer now" not in json.dumps(hist).lower()    # the nudge is not kept
+    finally:
+        srv.shutdown()
+
+
 def test_chat_turn_searches_current_questions_itself():
     """Left to decide, the model answered 'Jerome Powell' 3/3 without searching."""
     import time as t
