@@ -270,19 +270,40 @@ server is ollama, because that is the only server it was measured on.
 - **`web_search`** goes to a self-hosted [SearXNG](https://github.com/searxng/searxng)
   on the laptop (`NPU_CHAT_SEARX_URL`, default `http://127.0.0.1:8888`). The
   top 8 results go back to the model, plus SearXNG's direct answers when
-  there are any. **Searching sends your question to the public search engines**,
-  from your IP but not tied to any account. That is the one thing in npu-chat
-  that leaves the LAN, and a `· searching: …` line shows every time it happens.
+  there are any. **Searching sends the model's query to the public search
+  engines**, from your IP but not tied to any account. The model
+  writes every query; your own sentence is never sent. With `read_page`, that is
+  what npu-chat sends out of the LAN, and a `· searching: …` line shows every time
+  it happens.
+- **`read_page`** works like Claude Code's WebFetch. The model names a page from
+  this turn's results and what it wants from it. npu-chat fetches the page, keeps
+  the ~6000 characters that share the most words with the question, and has
+  `qwen3.5:4b` on the NPU (`NPU_CHAT_PAGE_MODEL`) answer from them in at most 80
+  words. Only that answer enters the conversation. The NPU does the reading, not
+  the chat model, because llama-server keeps one slot: a side request would throw
+  away its cache of the conversation, and the next turn would re-read all of it.
+  Measured on three real pages (Wikipedia, docs.python.org): 5.7–9.2 s per page,
+  fetch included. If the NPU fails, the best passages go back raw, cut to 800
+  characters. Only URLs from this turn's results on public addresses are read, so
+  a URL the model makes up can't carry the conversation out, and a result can't
+  point it at this box or the LAN.
 - **`grow_status`** reads what the grow daemons have already cached
   (`acinf bar`, `vivosun bar`, `yinmik bar`, 0.05 s). It never polls the cloud
   APIs, because AC Infinity answers extra polling with `403`.
 
-`--no-tools` turns both off. You hear "Let me check." while it looks things up.
+`--no-tools` turns them all off. You hear "Let me check." while it searches and
+"Let me read that." while it reads a page.
+
+**A turn that fails says so.** When the server rejects a turn, npu-chat speaks one
+sentence about it ("This conversation has filled my memory, so I can't answer."),
+and prints the server's own message. Before, a session that outgrew the 32K context
+answered nothing at all, in silence. A full conversation is still saved:
+`npu-chat --resume` reloads what you both said without the search results.
 
 **Web search alone can be turned off** with `NPU_CHAT_WEB_SEARCH=off`, `--no-search`,
-or `/search` during a chat (it toggles). Then npu-chat never searches by itself,
-the model is not offered `web_search`, a search call it writes anyway is answered
-"web search is off" without sending anything, and the system prompt tells it to say
+or `/search` during a chat (it toggles). Then npu-chat never makes the model search,
+the model is not offered `web_search` or `read_page`, a call it writes anyway is
+answered "web search is off" without sending anything, and the system prompt tells it to say
 it cannot check recent things rather than guess. Grow status still works. The banner
 shows `tools: grow status (web search off)`.
 
@@ -295,15 +316,33 @@ Ohio State's opener), 3 fresh runs each, `qwen3.5:9b-16k`:
 |---|---|---|
 | model decides when to search | 13/24 | 21/24 |
 | + year in the tool description, more results | 13/24 | 15/24 |
-| **npu-chat searches first when the question is about the present** | **21/24** | 24/24 |
+| npu-chat searches your own words first when the question is about the present | 21/24 | 24/24 |
+
+Since 2026-10-18 your words are not the query. On a question about the present, the
+model's first round must call `web_search` (`tool_choice: "required"`), so it
+writes the query itself; it can then read a page with `read_page`. Same 8
+questions, 3 runs each, but with Qwen 3.8 27B on the llama.cpp split and the
+engines below, so the rows are not a controlled comparison with the ones above:
+
+| version | correct | searched | median / max time |
+|---|---|---|---|
+| model must search first, writes its own query | 21/24 | 23/24 | 19.9 s / 41.8 s |
+| **+ "this year" means this year, + asks again if it skips the search** | **23/24** | **24/24** | 21.0 s / 50.7 s |
+
+In the first row the model searched "2025 Stanley Cup winner" and "2025 NBA Finals
+champion" for *this year* in 2026, and once answered without searching even
+though the call was required. So when you say "this year" and name no year, the
+query gets this year; and the forced round is held back until it has a search, so
+an unsearched answer is never spoken first. The one miss left was a fair reading:
+asked about "the World Cup", it searched the cricket World Cup. The cost is time:
+a researched answer takes about 20 s, where the September version took 2 s.
 
 When it decided alone, the model answered "Jerome Powell" three times out of three
 without searching. It searched "who won the Masters this year **2024**" in 2026.
 And after finding "Seahawks 29–13" it called that "an alternate timeline" and gave
 its training-era answer instead. So a question with words like *who won*,
-*this year*, *latest*, *current* or *price of* is now searched by npu-chat
-itself, with the year added, and the results are attached to your message. The
-model can still search again on its own. Grow questions work the same way:
+*this year*, *latest*, *current* or *price of* always gets a search, written by
+the model as above. The model can search again and read pages on its own. Grow questions work the same way:
 left to the model, 1 of 3 runs said "I can't see real-time grow room
 readings". With the readings attached whenever you mention the tent,
 reservoir, pH, humidity and so on, it got 6 of 6. A grow question is not also
@@ -319,9 +358,28 @@ included.
 **Engines block heavy use.** About 150 searches in 30 minutes got Brave and
 Google CSE rate-limited and DuckDuckGo blocked, which left zero results. With
 nothing to go on, the model said it "couldn't find" things rather than
-inventing them. SearXNG now also queries Bing, Google and Qwant, and when every
-engine is refusing, the tool result says *search is unavailable*, so the model
-says that instead of claiming nothing exists.
+inventing them. When every engine is refusing, the tool result says *search is
+unavailable*, so the model says that instead of claiming nothing exists.
+
+**Which engines answer changes, so measure it:** `evals/probe_searx.py` runs 10
+neutral queries 15 s apart and counts, per engine, the queries it returned
+results for. On 2026-10-18 only Bing and DuckDuckGo
+answered. Google, Google CSE, Qwant and Wikipedia refused from the first query of
+a fresh container, and Brave's page no longer parsed. With those off and Yahoo and
+Mojeek on, all four answered 10/10, with 15–23 results per query:
+
+```yaml
+engines:            # settings.yml, under use_default_settings: true
+  - {name: bing, disabled: false}
+  - {name: duckduckgo, disabled: false}
+  - {name: yahoo, disabled: false}
+  - {name: mojeek, disabled: false, inactive: false}
+  - {name: brave, disabled: true}
+  - {name: google, disabled: true}
+  - {name: google cse, disabled: true}
+  - {name: qwant, disabled: true}
+  - {name: wikipedia, disabled: true}   # its pages still come through the others
+```
 
 Any advice the model adds on top of the grow readings is its own opinion, not a
 rule anyone gave it. Asked the same question, it called pH 5.8 "a bit low" in one
@@ -332,7 +390,7 @@ SearXNG setup used here, local only:
 ```sh
 mkdir -p ~/.config/searxng && openssl rand -hex 32 > ~/.config/searxng/secret
 # settings.yml: use_default_settings: true; server.limiter: false;
-# search.formats: [html, json]; enable bing, google, qwant under engines:
+# search.formats: [html, json]; engines: see "Which engines answer" above
 docker run -d --name searxng --restart unless-stopped \
   -p 127.0.0.1:8888:8080 \
   -v ~/.config/searxng/settings.yml:/etc/searxng/settings.yml:ro \

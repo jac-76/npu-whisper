@@ -6,7 +6,7 @@ Runs the real chat_turn() from npu-chat against the desktop model, fresh history
 per run. PASS = the verified answer appears in the reply. Also records whether it
 searched at all, and wrong claims are visible in the printed replies.
 
-usage: NPU_CHAT_LLM_URL=http://HOST:11434 [PACE=15] evals/eval_search.py LABEL [RUNS]
+usage: NPU_CHAT_LLM_URL=http://HOST:PORT [NPU_CHAT_MODEL=...] [PACE=15] evals/eval_search.py LABEL [RUNS]
        PACE = seconds between questions; unpaced runs get engines rate-limited.
 """
 import json, os, re, sys, time, types
@@ -16,7 +16,8 @@ RUNS = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 m = types.ModuleType("c")
 HERE = os.path.dirname(os.path.abspath(__file__))
 exec(compile(open(os.path.join(HERE, "..", "npu-chat")).read(), "c", "exec"), m.__dict__)
-m.LLM_URL = os.environ["NPU_CHAT_LLM_URL"].rstrip("/")   # an ollama server
+m.LLM_URL = os.environ["NPU_CHAT_LLM_URL"].rstrip("/")   # ollama or llama-server
+SERVER = m.llm_server_kind(m.LLM_URL)
 MODEL = os.environ.get("NPU_CHAT_MODEL", "qwen3.5:9b-16k")
 
 QA = [
@@ -40,8 +41,8 @@ if CONFIG == "think":
         return b
     m.request_body = rb
 
-sysmsg = {"role": "system", "content": m.SYSTEM_PROMPT + m.TOOLS_HINT.format(
-    today=time.strftime("%A %B %-d, %Y"))}
+sysmsg = {"role": "system", "content": m.SYSTEM_PROMPT + m.tools_hint(
+    time.strftime("%A %B %-d, %Y"))}
 sink = open(os.devnull, "w")
 passes = searched = 0
 src_ok = src_wrong = warn_on_correct = warn_on_wrong = 0
@@ -55,7 +56,7 @@ for q, key in QA:
         stdout, sys.stdout = sys.stdout, sink       # stream_reply prints tokens
         try:
             found = []
-            reply, ttft, used, _ = m.chat_turn(MODEL, hist, q, "ollama", True,
+            reply, ttft, used, _ = m.chat_turn(MODEL, hist, q, SERVER, True,
                                                log=lambda *a: None, found=found)
         finally:
             sys.stdout = stdout

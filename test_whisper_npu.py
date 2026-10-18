@@ -806,14 +806,16 @@ def test_prewarm_loads_on_ollama_only(tmp_path):
 # --- tools: web search, grow status, routing ------------------------------------
 
 def _post_stub(handler_fn):
-    """HTTP stub; handler_fn(path, body_dict) -> (content_type, bytes)."""
+    """HTTP stub; handler_fn(path, body_dict) -> (content_type, bytes), or
+    (status, content_type, bytes)."""
     import http.server
     import threading
 
     class H(http.server.BaseHTTPRequestHandler):
         def _reply(self, body):
-            ctype, data = handler_fn(self.path, body)
-            self.send_response(200)
+            out = handler_fn(self.path, body)
+            status, (ctype, data) = (out[0], out[1:]) if len(out) == 3 else (200, out)
+            self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -847,9 +849,6 @@ def test_year_goes_into_search_tool_and_queries():
     desc = m.tools_for(t.strptime("2026-09-29", "%Y-%m-%d"))[0]["function"]["description"]
     assert "It is 2026" in desc and "{year}" not in desc
     assert "{year}" in m.TOOLS[0]["function"]["description"]   # template untouched
-    assert m.search_query_for("Who won the Masters this year?", 2026) == \
-        "Who won the Masters this year? 2026"
-    assert m.search_query_for("Who won the 2025  Masters?", 2026) == "Who won the 2025 Masters?"
 
 
 def test_routing_patterns():
@@ -988,19 +987,25 @@ def test_chat_turn_answers_when_out_of_tool_rounds():
         srv.shutdown()
 
 
-def test_chat_turn_searches_current_questions_itself():
-    """Left to decide, the model answered 'Jerome Powell' 3/3 without searching."""
-    import time as t
+def test_current_question_forces_a_search_the_model_writes():
+    """Left to decide, the model answered 'Jerome Powell' 3/3 without searching,
+    so a current question still gets a search, but the model writes the query:
+    the user's own sentence used to be sent (2026-10-17, 6 of 22 searches)."""
     import urllib.parse as up
 
     m = _load_chat()
-    queries = []
+    queries, seen = [], []
 
     def handler(path, body):
         if path.startswith("/search"):
             queries.append(up.parse_qs(up.urlsplit(path).query)["q"][0])
             return "application/json", json.dumps(
                 {"results": [{"title": "Warsh sworn in", "url": "https://f", "content": "chair"}]}).encode()
+        seen.append(body)
+        if body.get("tool_choice") == "required":
+            return _sse({"choices": [{"delta": {"tool_calls": [
+                {"id": "c1", "index": 0, "function": {"name": "web_search",
+                                                      "arguments": '{"query":"Federal Reserve chair 2026"}'}}]}}]})
         return _sse({"choices": [{"delta": {"content": "Kevin Warsh."}}]})
 
     base, srv = _post_stub(handler)
@@ -1008,11 +1013,17 @@ def test_chat_turn_searches_current_questions_itself():
         m.LLM_URL = base
         m.SEARX_URL = base
         hist = [{"role": "system", "content": "s"}]
-        reply, _, used, _ = m.chat_turn("m", hist, "Who is the chair of the Federal Reserve?",
-                                        "ollama", True, log=lambda *a: None)
-        assert len(queries) == 1 and queries[0].endswith(str(t.localtime().tm_year))
-        assert used[0]["auto"] is True
-        assert "Warsh sworn in" in hist[1]["content"]
+        question = "Who is the chair of the Federal Reserve? Asking for my aunt Linda."
+        reply, _, used, _ = m.chat_turn("m", hist, question, "llama.cpp", True,
+                                        log=lambda *a: None)
+        assert queries == ["Federal Reserve chair 2026"]          # the model's words only
+        assert [t["function"]["name"] for t in seen[0]["tools"]] == ["web_search"]
+        assert "tool_choice" not in seen[1] and "read_page" in json.dumps(seen[1]["tools"])
+        assert used == [{"name": "web_search", "args": {"query": "Federal Reserve chair 2026"},
+                         "forced": True}]
+        assert hist[1]["content"] == question
+        assert [h["role"] for h in hist] == ["system", "user", "assistant", "tool"]
+        assert reply == "Kevin Warsh."
     finally:
         srv.shutdown()
 
@@ -1046,7 +1057,8 @@ def test_search_off_sends_nothing_to_the_search_engines():
                                         search_on=False)
         assert queries == []
         offered = [t["function"]["name"] for t in seen[0]["tools"]]
-        assert "web_search" not in offered and "grow_status" in offered
+        assert "web_search" not in offered and "read_page" not in offered
+        assert "grow_status" in offered and "tool_choice" not in seen[0]
         assert hist[1]["content"] == question                  # no results pasted in
         assert used == [{"name": "web_search", "args": {"query": "fed chair 2026"},
                          "result": "not sent: web search is off"}]
@@ -1064,9 +1076,166 @@ def test_search_off_comes_from_the_environment_and_reaches_the_prompt(monkeypatc
     m = _load_chat()
     assert m.WEB_SEARCH is True                                 # unchanged by default
     on, off = m.tools_hint("Saturday October 17, 2026"), m.tools_hint("Saturday October 17, 2026", False)
-    assert "web_search" in on and "web_search" not in off
+    assert "web_search" in on and "read_page" in on
+    assert "web_search" not in off and "read_page" not in off
     assert "cannot look anything up" in off and "grow_status" in off and "October 17" in off
     assert [t["function"]["name"] for t in m.tools_for(search=False)] == ["grow_status", "grow_control"]
+
+
+def test_forced_search_asks_again_before_saying_an_unsearched_answer():
+    """2026-10-18 eval: once in 24, llama-server let Qwen answer "the 2026 World
+    Cup hasn't happened yet" despite tool_choice "required"."""
+    import urllib.parse as up
+
+    m = _load_chat()
+    queries, spoken = [], []
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            queries.append(up.parse_qs(up.urlsplit(path).query)["q"][0])
+            return "application/json", json.dumps(
+                {"results": [{"title": "Spain beat Argentina", "url": "https://f", "content": "final"}]}).encode()
+        if body.get("tool_choice") != "required":
+            return _sse({"choices": [{"delta": {"content": "Spain won."}}]})
+        if body["messages"][-1] == m.SEARCH_FIRST:
+            return _sse({"choices": [{"delta": {"tool_calls": [
+                {"id": "c1", "index": 0, "function": {"name": "web_search",
+                                                      "arguments": '{"query":"World Cup 2026 winner"}'}}]}}]})
+        return _sse({"choices": [{"delta": {"content": "The 2026 World Cup hasn't happened yet."}}]})
+
+    base, srv = _post_stub(handler)
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        hist = [{"role": "system", "content": "s"}]
+        reply, _, used, _ = m.chat_turn("m", hist, "Who won the World Cup this year?", "llama.cpp",
+                                        True, on_delta=spoken.append, log=lambda *a: None)
+        assert queries == ["World Cup 2026 winner"] and reply == "Spain won."
+        assert "happened" not in "".join(spoken)
+        assert m.SEARCH_FIRST not in hist
+    finally:
+        srv.shutdown()
+
+
+def test_this_year_means_this_year_in_the_query():
+    """Qwen 3.8 searched '2025 Stanley Cup winner' for 'this year' in 2026."""
+    m = _load_chat()
+    q = lambda args, said: json.loads(m.query_for_this_year(json.dumps(args), said, 2026))["query"]
+    assert q({"query": "2025 Stanley Cup winner"}, "Who won the Stanley Cup this year?") == \
+        "2026 Stanley Cup winner"
+    assert q({"query": "Stanley Cup winner"}, "Who won the Stanley Cup this year?") == \
+        "Stanley Cup winner 2026"
+    assert q({"query": "NBA 2025-26 standings"}, "How is the NBA going this year?").startswith(
+        "NBA 2025-26 standings")                                   # a season is left alone
+    assert q({"query": "2026 Masters winner"}, "Who won the Masters this year?") == "2026 Masters winner"
+    assert q({"query": "2025 Stanley Cup winner"}, "Who won the Stanley Cup last year?") == \
+        "2025 Stanley Cup winner"
+    assert q({"query": "2024 Stanley Cup winner"}, "Who won it in 2024, this year or not?") == \
+        "2024 Stanley Cup winner"                                  # the user named a year
+
+
+_PAGE = """<html><head><title>2026 Kentucky Derby - Racing</title>
+<script>var trackers = "Golden Tempo derby ad script";</script></head><body>
+<nav><a href="/">Home</a> <a href="/racing">Racing news and the Kentucky Derby archive</a></nav>
+<div>Subscribe to our newsletter for daily racing tips and offers from partners.</div>
+<p>The 152nd Kentucky Derby was run on May 2, 2026. Golden Tempo, ridden by Jose Ortiz,
+won by a length over Renegade.</p>
+<footer>Copyright 2026 Racing Media, all rights reserved, Kentucky Derby is a trademark.</footer>
+</body></html>"""
+
+
+def _page_stub(npu_answer):
+    """One server: GET /page is the web page, POST /v1/chat/completions the NPU."""
+    asked = []
+
+    def handler(path, body):
+        if path == "/page":
+            return "text/html; charset=utf-8", _PAGE.encode()
+        asked.append(body)
+        if npu_answer is None:
+            return 500, "text/plain", b"npu busy"
+        return "application/json", json.dumps(
+            {"choices": [{"message": {"content": npu_answer}}]}).encode()
+
+    base, srv = _post_stub(handler)
+    return base, srv, asked
+
+
+def test_read_page_hands_the_npu_only_the_relevant_text():
+    """Like WebFetch: the small model on the NPU reads the page, and only its
+    short answer comes back for the conversation."""
+    m = _load_chat()
+    base, srv, asked = _page_stub("Golden Tempo won, ridden by Jose Ortiz.")
+    try:
+        m.URL = base
+        m._public_host = lambda host: True          # the stub is on 127.0.0.1
+        found = [{"title": "Derby", "url": f"{base}/page", "content": "snippet"}]
+        out = m.read_page(f"{base}/page", "Who won the 2026 Kentucky Derby?", found=found)
+        assert out == f"From {base}/page:\nGolden Tempo won, ridden by Jose Ortiz."
+        assert asked[0]["model"] == m.PAGE_MODEL and asked[0]["stream"] is False
+        page_text = asked[0]["messages"][1]["content"]
+        assert "won by a length over Renegade" in page_text
+        assert "ad script" not in page_text and "Home" not in page_text   # script, menu
+        assert found[-1] == {"title": "2026 Kentucky Derby - Racing", "url": f"{base}/page",
+                             "content": "Golden Tempo won, ridden by Jose Ortiz."}
+    finally:
+        srv.shutdown()
+
+
+def test_read_page_falls_back_to_the_best_passage_when_the_npu_fails():
+    m = _load_chat()
+    base, srv, asked = _page_stub(None)
+    try:
+        m.URL = base
+        m._public_host = lambda host: True
+        found = [{"title": "Derby", "url": f"{base}/page", "content": "snippet"}]
+        out = m.read_page(f"{base}/page", "Who won the 2026 Kentucky Derby?", found=found)
+        assert len(asked) == 1 and "Golden Tempo, ridden by Jose Ortiz" in out
+        assert len(out) <= len(f"From {base}/page:\n") + 800 and "ad script" not in out
+    finally:
+        srv.shutdown()
+
+
+def test_read_page_reads_only_this_turns_results_on_public_hosts():
+    """A URL the model writes itself could carry the conversation out in its
+    query string; a result could point at this box or the LAN."""
+    m = _load_chat()
+    base, srv, asked = _page_stub("x")
+    try:
+        m.URL = base
+        out = m.read_page(f"{base}/page?q=my+secret", "q", found=[{"url": f"{base}/page"}])
+        assert out.startswith("Not read") and asked == []
+        out = m.read_page(f"{base}/page", "q", found=[{"url": f"{base}/page"}])
+        assert out.startswith("Not read") and asked == []          # 127.0.0.1 is not public
+    finally:
+        srv.shutdown()
+    for host in ("127.0.0.1", "10.0.0.2", "192.168.0.10", "localhost", "printer.local", None):
+        assert not m._public_host(host), host
+    assert m._public_host("1.1.1.1")
+    assert not m._public_url("ftp://1.1.1.1/x") and not m._public_url("file:///etc/passwd")
+
+
+def test_a_failed_turn_says_why_instead_of_going_silent():
+    """2026-10-17: a session that filled the 32K context answered nothing, in
+    silence."""
+    m = _load_chat()
+    full = json.dumps({"error": {"code": 400, "type": "exceed_context_size_error", "message":
+                                 "request (32803 tokens) exceeds the available context size "
+                                 "(32768 tokens), try increasing it"}}).encode()
+    base, srv = _post_stub(lambda path, body: (400, "application/json", full))
+    try:
+        m.LLM_URL = base
+        reply, _, _ = m.stream_reply("m", [{"role": "user", "content": "hi"}], "llama.cpp")
+        assert reply == "" and m.LAST_LLM_ERROR["kind"] == "full"
+        assert "32803 tokens" in m.LAST_LLM_ERROR["detail"]
+        assert m.failure_notice(m.LAST_LLM_ERROR) == \
+            "This conversation has filled my memory, so I can't answer."
+    finally:
+        srv.shutdown()
+    m.LLM_URL = "http://127.0.0.1:9"           # nothing listens there
+    m.stream_reply("m", [{"role": "user", "content": "hi"}], "llama.cpp")
+    assert m.failure_notice(m.LAST_LLM_ERROR) == "I can't reach the model right now."
+    assert m.failure_notice({}) == "I didn't get an answer that time."
 
 
 def test_grow_status_reads_cached_bar_json(tmp_path):
@@ -1501,6 +1670,10 @@ def test_grow_questions_are_not_web_searched():
         if path.startswith("/search"):
             queries.append(path)
             return "application/json", b'{"results": []}'
+        if body.get("tool_choice") == "required":
+            return _sse({"choices": [{"delta": {"tool_calls": [
+                {"id": "c1", "index": 0, "function": {"name": "web_search",
+                                                      "arguments": '{"query":"weather today"}'}}]}}]})
         return _sse({"choices": [{"delta": {"content": "It is 5.8."}}]})
 
     base, srv = _post_stub(handler)

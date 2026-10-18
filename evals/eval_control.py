@@ -22,7 +22,7 @@ CASES = [
     ("Turn the grow light off.", ["vivosun", "set", "light", "0"]),
     ("Put the duct fan on 4.", ["vivosun", "set", "duct", "4"]),
 ]
-system = (m.SYSTEM_PROMPT + m.TOOLS_HINT.format(today=time.strftime("%A %B %-d, %Y")))
+system = (m.SYSTEM_PROMPT + m.tools_hint(time.strftime("%A %B %-d, %Y")))
 ACINF = m._cached_tooltip("acinf")
 VIVO = m._cached_tooltip("vivosun")
 
