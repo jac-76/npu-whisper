@@ -615,7 +615,7 @@ def _kokoro_in(m, tmp_path, worker_src):
     os.symlink(sys.executable, d / "venv" / "bin" / "python")
     (d / "kokoro-v1.0.onnx").write_bytes(b"model")
     with zipfile.ZipFile(d / "voices-v1.0.bin", "w") as z:
-        for name in ("af_heart", "bm_george", "jf_alpha"):
+        for name in ("af_heart", "am_michael", "bm_george", "jf_alpha"):
             z.writestr(name + ".npy", b"")
     worker = tmp_path / "npu-kokoro"
     worker.write_text(worker_src)
@@ -691,6 +691,58 @@ def test_self_facts_names_the_kokoro_voice():
     s = m.self_facts("x", "kokoro:af_heart")
     assert "your voice is kokoro af_heart, which runs on the CPU" in s
     assert "piper" not in s
+
+
+JARVIS = "kokoro:bm_george*0.6+am_michael*0.4"
+
+
+def test_kokoro_blend_resolves_only_when_every_voice_is_installed(tmp_path):
+    """The Jarvis-type voice the user kept (2026-10-18) is a blend of two."""
+    m = _chat_in(tmp_path)
+    _kokoro_in(m, tmp_path, FAKE_KOKORO)
+    assert m.find_voice(JARVIS) == JARVIS
+    assert m.blend_parts("bm_george*3+am_michael*1") == [("bm_george", 0.75), ("am_michael", 0.25)]
+    for bad in ("kokoro:bm_george*0.6+am_nobody*0.4", "kokoro:bm_george*x+am_michael",
+                "kokoro:bm_george*-1+am_michael*2", "kokoro:bm_george*0", "kokoro:bm_george+"):
+        assert m.find_voice(bad) is None, bad
+    sp = m.Speaker(JARVIS, player=["true"])
+    sp.say("Good evening.")
+    sp.wait_idle(10)
+    assert (tmp_path / "npu-kokoro.starts").read_text() == "bm_george*0.6+am_michael*0.4\n"
+
+
+def test_self_facts_describes_a_blend_in_words():
+    """The model reads this out when asked about its voice."""
+    s = _load_chat().self_facts("x", JARVIS)
+    assert ("your voice is a blend of the Kokoro voices bm_george (60%) and am_michael (40%), "
+            "which runs on the CPU") in s
+
+
+def test_persona_file_joins_the_system_prompt(tmp_path, monkeypatch):
+    f = tmp_path / "persona.txt"
+    f.write_text("Speak like a  composed butler.\nDry wit, sparingly.\n")
+    monkeypatch.setenv("NPU_CHAT_PERSONA_FILE", str(f))
+    assert _load_chat().persona() == " Speak like a composed butler. Dry wit, sparingly."
+    monkeypatch.setenv("NPU_CHAT_PERSONA_FILE", str(tmp_path / "none.txt"))
+    assert _load_chat().persona() == ""
+
+
+def test_real_kokoro_speaks_a_blend(tmp_path):
+    """The real npu-kokoro mixing two installed voices; skipped without Kokoro."""
+    import pytest
+    import wave
+
+    m = _chat_in(tmp_path)
+    if not m.find_voice(JARVIS):
+        pytest.skip(f"Kokoro is not installed in {m.KOKORO_DIR}")
+    synth = m._kokoro_synth_factory(JARVIS[len("kokoro:"):])
+    wav = str(tmp_path / "s.wav")
+    try:
+        assert synth("Good evening.", wav)
+    finally:
+        synth.close()
+    with wave.open(wav) as w:
+        assert w.getframerate() == 24000 and w.getnframes() > 0.3 * 24000
 
 
 def test_real_kokoro_writes_speech(tmp_path):

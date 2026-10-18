@@ -5,11 +5,25 @@ npu-chat starts this once per Kokoro voice, under the Python that has
 kokoro-onnx (README: Kokoro), and keeps it: the model loads once, then each
 input line is one sentence, {"text": ..., "wav": ...}. The WAV is written and
 "ok" printed, or "error: ..." on failure. Exits at end of input.
+
+VOICE is a voice name (bm_george) or a blend of them with weights
+(bm_george*0.6+am_michael*0.4); the first voice's accent is used.
 """
 
 import json
 import sys
 import wave
+
+
+def voice_style(kokoro, spec: str):
+    """A voice name as is, or a blend as the weighted mean of the voices'
+    style vectors, which kokoro-onnx's create() takes in place of a name."""
+    parts = [p.strip().partition("*") for p in spec.split("+")]
+    if len(parts) == 1 and not parts[0][1]:
+        return spec
+    weights = [float(w) if star else 1.0 for _, star, w in parts]
+    style = sum(kokoro.get_voice_style(name) * w for (name, _, _), w in zip(parts, weights))
+    return (style / sum(weights)).astype("float32")
 
 
 def main(argv: list[str]) -> int:
@@ -20,8 +34,9 @@ def main(argv: list[str]) -> int:
         from kokoro_onnx import Kokoro
 
         kokoro = Kokoro(model, voices)
+        voice = voice_style(kokoro, name)
         # The first call is slower; pay it here, and fail now on a bad voice.
-        kokoro.create("Ready.", voice=name, speed=1.0, lang=lang)
+        kokoro.create("Ready.", voice=voice, speed=1.0, lang=lang)
     except Exception as exc:
         print(f"error: {exc}", flush=True)
         return 1
@@ -29,7 +44,7 @@ def main(argv: list[str]) -> int:
     for line in sys.stdin:
         try:
             req = json.loads(line)
-            samples, rate = kokoro.create(req["text"], voice=name, speed=1.0, lang=lang)
+            samples, rate = kokoro.create(req["text"], voice=voice, speed=1.0, lang=lang)
             # piper scales every sentence to full scale and Kokoro does not:
             # unscaled, it played 6-9 dB quieter than the piper voices.
             peak = float(np.abs(samples).max()) if len(samples) else 0.0

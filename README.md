@@ -671,6 +671,32 @@ Through npu-chat's speaker, with a three-sentence reply fed at once (first sente
 `af_heart`, no gap between sentences with either, and the two play at -15.5 and
 -16.5 LUFS.
 
+**Blends make new voices.** A Kokoro voice is a style vector, so a weighted mix
+of several is a voice of its own: `--voice 'kokoro:bm_george*0.6+am_michael*0.4'`
+(quote it: `*` is a shell wildcard). The weights are normalized, and the accent is
+the first voice's (`b…` British English). That one, a calm British male, is the
+Jarvis-type voice used here: Kokoro's best British voices grade C, so George is
+steadied with Michael (C+, trained on hours rather than minutes), which
+still speaks British English under the en-gb phonemes. A blend costs nothing
+extra: through the speaker, first audio 0.88–0.90 s, as with `af_heart`. Asked
+about its voice, the model says which voices it is made of.
+
+**A personality** goes in `~/.config/npu-chat/persona.txt` (`NPU_CHAT_PERSONA_FILE`
+moves it): its text is added to the system prompt, and the banner shows
+`persona: …` while it is in use. Delete the file to go without. The one used
+with the Jarvis-type voice:
+
+```
+Your manner is that of a composed, quick-witted British assistant: calm, precise
+and courteous, with a dry, understated humour used sparingly. Be candid: if
+something is a bad idea, say so politely and say why. Never gush or flatter.
+If the user ever sounds unwell or talks about harming themselves, drop the wit
+and answer with real care.
+```
+
+It is a voice in that spirit, not a copy of an actor: cloning a real person's
+voice needs that person's consent.
+
 ### Speech gate: Silero VAD ahead of whisper
 
 whisper large-v3-turbo invents text from room noise, so every capture is

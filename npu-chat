@@ -87,6 +87,19 @@ SYSTEM_PROMPT = (
     "The user speaks to you, so keep replies short and conversational: "
     "two or three sentences unless asked for detail. Never use markdown."
 )
+# A personality added to the system prompt, kept in its own file so it can be
+# edited without touching this script. Without the file there is none.
+PERSONA_FILE = os.path.expanduser(
+    os.environ.get("NPU_CHAT_PERSONA_FILE", "~/.config/npu-chat/persona.txt"))
+
+
+def persona() -> str:
+    """The persona file's text, ready to add to the system prompt."""
+    try:
+        text = " ".join(open(PERSONA_FILE, encoding="utf-8").read().split())
+    except OSError:
+        return ""
+    return f" {text}" if text else ""
 
 
 def llm_where_default(llm_url: str) -> str:
@@ -1138,7 +1151,11 @@ def self_facts(model: str, voice: str | None, llm_on_npu: bool = True,
             "speech recognition is whisper-large-v3-turbo running on this "
             "laptop's AMD Ryzen AI 9 365 (XDNA2) NPU",
         ]
-    if voice and voice.startswith("kokoro:"):
+    parts = blend_parts(voice[len("kokoro:"):]) if voice and voice.startswith("kokoro:") else None
+    if parts and len(parts) > 1:
+        mix = " and ".join(f"{n} ({round(w * 100)}%)" for n, w in parts)
+        bits.append(f"your voice is a blend of the Kokoro voices {mix}, which runs on the CPU")
+    elif voice and voice.startswith("kokoro:"):
         bits.append(f"your voice is kokoro {voice[len('kokoro:'):]}, which runs on the CPU")
     elif voice:
         bits.append(f"your voice is piper {voice}, which runs on the CPU")
@@ -1613,6 +1630,24 @@ def kokoro_voices() -> list[str]:
     return sorted(n for n in names if n[:1] in ("a", "b"))
 
 
+def blend_parts(spec: str) -> list[tuple[str, float]] | None:
+    """A Kokoro voice as (name, share) pairs: "af_heart" is [("af_heart", 1.0)],
+    "bm_george*0.6+am_michael*0.4" is a blend, its shares summing to 1. None
+    when a weight is not a positive number."""
+    parts = []
+    for piece in spec.split("+"):
+        name, star, weight = piece.strip().partition("*")
+        try:
+            w = float(weight) if star else 1.0
+        except ValueError:
+            return None
+        if not name or not 0 < w < 1e6:
+            return None
+        parts.append((name, w))
+    total = sum(w for _, w in parts)
+    return [(n, w / total) for n, w in parts]
+
+
 def voice_label(voice: str) -> str:
     """The id a resolved voice goes by: en_GB-cori-high, kokoro:af_heart."""
     return voice if voice.startswith("kokoro:") else os.path.basename(voice)[:-5]
@@ -1620,9 +1655,12 @@ def voice_label(voice: str) -> str:
 
 def find_voice(name: str) -> str | None:
     """Resolve a piper voice id (or path) to an .onnx on disk, or a
-    kokoro:NAME id to itself when that Kokoro voice is installed."""
+    kokoro:NAME id, or a blend kokoro:NAME*W+NAME*W, to itself when every
+    Kokoro voice in it is installed."""
     if name.startswith("kokoro:"):
-        return name if name[len("kokoro:"):] in kokoro_voices() else None
+        parts = blend_parts(name[len("kokoro:"):])
+        installed = kokoro_voices()
+        return name if parts and all(n in installed for n, _ in parts) else None
     if os.path.sep in name:
         return name if os.path.exists(name) else None
     if name.endswith(".onnx") and os.path.exists(name):
@@ -1935,7 +1973,8 @@ HELP = f"""{BOLD}Commands{RESET}
   {CYAN}/model NAME{RESET}    switch LLM (e.g. /model qwen3:4b)
   {CYAN}/models{RESET}        list models installed on this box
   {CYAN}/speak{RESET}         toggle spoken replies
-  {CYAN}/voice NAME{RESET}    switch voice (e.g. /voice en_US-amy-medium, /voice kokoro:af_heart)
+  {CYAN}/voice NAME{RESET}    switch voice (e.g. /voice en_US-amy-medium, /voice kokoro:af_heart,
+                 a blend: /voice kokoro:bm_george*0.6+am_michael*0.4)
   {CYAN}/voices{RESET}        list voices installed on this box
   {CYAN}/search{RESET}        toggle web search (off: nothing you ask leaves for search engines)
   {CYAN}/reset{RESET}         clear the conversation
@@ -2543,7 +2582,7 @@ def main() -> int:
     ap.add_argument("--no-speak", action="store_true",
                     help="do not speak replies (text only)")
     ap.add_argument("--voice", default=DEFAULT_VOICE,
-                    help=f"piper voice id or .onnx path, or kokoro:NAME "
+                    help=f"piper voice id or .onnx path, kokoro:NAME, or a blend kokoro:NAME*W+NAME*W "
                          f"(default {DEFAULT_VOICE})")
     ap.add_argument("--system", default=SYSTEM_PROMPT, help="override the system prompt")
     ap.add_argument("--llm-url", default=os.environ.get("NPU_CHAT_LLM_URL") or None,
@@ -2647,9 +2686,9 @@ def main() -> int:
         hint = (tools_hint(time.strftime("%A %B %-d, %Y"), search_on)
                 if tools_on else "")
         return {"role": "system",
-                "content": args.system + self_facts(model, voice_id,
-                                                    LLM_URL == URL,
-                                                    llm_server, llm_where) + hint}
+                "content": args.system + persona() + self_facts(model, voice_id,
+                                                                LLM_URL == URL,
+                                                                llm_server, llm_where) + hint}
 
     history = [system_msg()]
 
@@ -2694,6 +2733,8 @@ def main() -> int:
                   else " | tools: grow status (web search off)")
     print(f"{DIM}model {model} | {voice_note}{tools_note} | press Enter to talk, "
           f"/help for commands{RESET}")
+    if persona():
+        print(f"{DIM}persona: {PERSONA_FILE}{RESET}")
     if transcript:
         print(f"{DIM}transcript: {transcript.md}{RESET}")
     if resumed_from:
