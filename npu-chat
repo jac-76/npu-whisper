@@ -104,6 +104,14 @@ def llm_where_default(llm_url: str) -> str:
 TOOL_SERVERS = ("ollama", "llama.cpp")
 
 SEARX_URL = os.environ.get("NPU_CHAT_SEARX_URL", "http://127.0.0.1:8888")
+# Search is the one thing npu-chat sends to outside services by itself.
+# NPU_CHAT_WEB_SEARCH=off (or --no-search, or /search during a chat) keeps every
+# question on this box: no web_search tool, no automatic search, and the model
+# is told it cannot look things up.
+WEB_SEARCH = os.environ.get("NPU_CHAT_WEB_SEARCH", "on").strip().lower() not in (
+    "off", "0", "no", "false")
+SEARCH_OFF = ("Web search is off: nothing was looked up or sent anywhere. Tell the "
+              "user you cannot check that.")
 MAX_TOOL_ROUNDS = 3
 # The last round offers no tools. Qwen 3.8 on llama-server kept searching
 # anyway and wrote the call out as text ("<tool_call> <function=web_search>
@@ -158,26 +166,43 @@ TOOLS = [
                        "required": ["device", "target", "value"]}}},
 ]
 
-def tools_for(today: time.struct_time | None = None) -> list[dict]:
-    """TOOLS with the current year written into the search description."""
+def tools_for(today: time.struct_time | None = None, search: bool = True) -> list[dict]:
+    """TOOLS with the current year written into the search description, and
+    without web_search when search is off."""
     year = str((today or time.localtime()).tm_year)
     out = json.loads(json.dumps(TOOLS))
     fn = out[0]["function"]
     fn["description"] = fn["description"].replace("{year}", year)
+    if not search:
+        out = [t for t in out if t["function"]["name"] != "web_search"]
     return out
 
 
-TOOLS_HINT = (
-    " You have tools. Use web_search for anything current, recent or that you are "
+SEARCH_HINT = (
+    " Use web_search for anything current, recent or that you are "
     "not sure of, then answer from the results and say which site it came from. "
     "Search results are newer than your training: when they disagree with what "
     "you remember, the results are right, so report them without doubting them. "
     "If the results do not contain the answer, search again with a more specific "
-    "query that includes the year, instead of answering from memory. "
-    "Use grow_status for any question about the grow, tent, plants, reservoir, pH, "
+    "query that includes the year, instead of answering from memory."
+)
+# Left alone, the model answers recent questions from stale memory ("Jerome
+# Powell", 3/3, at CURRENT_WORDS below), so it is told plainly it cannot check.
+NO_SEARCH_HINT = (
+    " Web search is off, so you cannot look anything up. For news, prices, scores "
+    "or anything else recent, say you cannot check it instead of guessing."
+)
+GROW_HINT = (
+    " Use grow_status for any question about the grow, tent, plants, reservoir, pH, "
     "EC, humidity or temperature there, and call it again every time, because the "
     "readings change. Today is {today}."
 )
+
+
+def tools_hint(today: str, search: bool = True) -> str:
+    """The tool instructions for the system prompt, with or without search."""
+    return (" You have tools." + (SEARCH_HINT if search else NO_SEARCH_HINT)
+            + GROW_HINT.format(today=today))
 
 
 def web_search(query: str, n: int = 8, found: list | None = None) -> str:
@@ -659,9 +684,11 @@ def describe_call(name: str, args: dict) -> str:
 
 
 def run_tool(name: str, raw_args: str, found: list | None = None,
-             confirm=None) -> tuple[dict, str]:
+             confirm=None, search: bool = True) -> tuple[dict, str]:
     """Run one tool call. grow_control changes real hardware, so it runs only
-    when `confirm(question)` returns True; with no confirm it never runs."""
+    when `confirm(question)` returns True; with no confirm it never runs.
+    With search off, a web_search call (Qwen writes calls for tools it was not
+    offered) is answered without sending anything."""
     try:
         args = json.loads(raw_args or "{}")
         if not isinstance(args, dict):
@@ -669,6 +696,8 @@ def run_tool(name: str, raw_args: str, found: list | None = None,
     except json.JSONDecodeError:
         return {}, f"could not parse arguments: {raw_args!r}"
     if name == "web_search":
+        if not search:
+            return args, SEARCH_OFF
         q = str(args.get("query") or "").strip()
         return args, web_search(q, found=found) if q else "empty query"
     if name == "grow_status":
@@ -725,13 +754,15 @@ def history_from_log(path: str) -> list[dict]:
 def chat_turn(model: str, history: list[dict], user_text: str,
               server: str | None, tools_on: bool, on_delta=None,
               log=print, found: list | None = None, confirm=None,
-              grow_out: list | None = None
+              grow_out: list | None = None, search_on: bool = True
               ) -> tuple[str, float | None, list[dict], bool]:
     """One user turn, tool calls included. Mutates `history`.
 
     Returns (reply, time to first text, tools used, grow readings attached).
     Every search result seen this turn is appended to `found`, for attribution,
-    and the grow readings attached to it to `grow_out`.
+    and the grow readings attached to it to `grow_out`. With `search_on` False
+    nothing goes to the search engines: no automatic search, and web_search is
+    neither offered nor run.
     On an empty reply the caller rolls history back.
     """
     if tools_on and confirm is not None:
@@ -754,7 +785,7 @@ def chat_turn(model: str, history: list[dict], user_text: str,
     # A grow question ("What's the pH right now?") is answered from the
     # readings; sending it to public engines too only produced a false "not in
     # the search results" warning. Unless it is about the weather outside.
-    if tools_on and CURRENT_WORDS.search(user_text) and (
+    if tools_on and search_on and CURRENT_WORDS.search(user_text) and (
             not grow_attached or OUTSIDE_WORDS.search(user_text)):
         year = time.localtime().tm_year
         log(f"{DIM}· searching: {search_query_for(user_text, year)}{RESET}")
@@ -770,7 +801,7 @@ def chat_turn(model: str, history: list[dict], user_text: str,
     for round_ in range(MAX_TOOL_ROUNDS + 1):
         calls: list[dict] = []
         out_of_rounds = tools_on and round_ == MAX_TOOL_ROUNDS
-        offer = tools_for() if tools_on and not out_of_rounds else None
+        offer = tools_for(search=search_on) if tools_on and not out_of_rounds else None
         t_round = time.time()
         reply, r_ttft, _ = stream_reply(model, history + [ANSWER_NOW] if out_of_rounds else history,
                                         server, on_delta=on_delta, tools=offer,
@@ -779,7 +810,8 @@ def chat_turn(model: str, history: list[dict], user_text: str,
             ttft = (t_round - t_turn) + r_ttft
         if not calls:
             break
-        if on_delta and not used and any(c["name"] != "grow_control" for c in calls):
+        quiet = {"grow_control"} if search_on else {"grow_control", "web_search"}
+        if on_delta and not used and any(c["name"] not in quiet for c in calls):
             on_delta("Let me check. ")    # something to hear while it looks
         history.append({"role": "assistant", "content": reply or "",
                         "tool_calls": [
@@ -792,10 +824,15 @@ def chat_turn(model: str, history: list[dict], user_text: str,
                 preview = json.loads(c["arguments"] or "{}")
             except json.JSONDecodeError:
                 preview = {}
-            log(f"{DIM}· {describe_call(c['name'], preview if isinstance(preview, dict) else {})}{RESET}")
+            if c["name"] == "web_search" and not search_on:
+                log(f"{DIM}· web search is off - nothing sent{RESET}")
+            else:
+                log(f"{DIM}· {describe_call(c['name'], preview if isinstance(preview, dict) else {})}{RESET}")
             args_used, result = run_tool(c["name"], c["arguments"], found=found,
-                                         confirm=confirm)
+                                         confirm=confirm, search=search_on)
             entry = {"name": c["name"], "args": args_used}
+            if result == SEARCH_OFF:
+                entry["result"] = "not sent: web search is off"
             if c["name"] == "grow_control":
                 entry["result"] = result
                 log(f"{DIM}  {result}{RESET}")
@@ -1618,6 +1655,7 @@ HELP = f"""{BOLD}Commands{RESET}
   {CYAN}/speak{RESET}         toggle spoken replies
   {CYAN}/voice NAME{RESET}    switch voice (e.g. /voice en_US-amy-medium, /voice kokoro:af_heart)
   {CYAN}/voices{RESET}        list voices installed on this box
+  {CYAN}/search{RESET}        toggle web search (off: nothing you ask leaves for search engines)
   {CYAN}/reset{RESET}         clear the conversation
   {CYAN}/help{RESET}          this list
   {CYAN}/quit{RESET}          exit"""
@@ -2238,6 +2276,9 @@ def main() -> int:
     ap.add_argument("--no-tools", action="store_true",
                     help="do not offer the model web search or grow status "
                          "(tools are only offered to ollama and llama-server)")
+    ap.add_argument("--no-search", action="store_true",
+                    help="no web search: nothing you ask is sent to search engines "
+                         "(also NPU_CHAT_WEB_SEARCH=off; /search toggles it)")
     ap.add_argument("--resume", action="store_true",
                     help="continue the most recent chat session from its transcript")
     ap.add_argument("--confirm", action="store_true",
@@ -2316,11 +2357,12 @@ def main() -> int:
         speaking = False
 
     tools_on = not args.no_tools and llm_server in TOOL_SERVERS
+    search_on = tools_on and WEB_SEARCH and not args.no_search
 
     def system_msg() -> dict:
         voice_id = (voice_label(voice_path)
                     if speaking and voice_path else None)
-        hint = (TOOLS_HINT.format(today=time.strftime("%A %B %-d, %Y"))
+        hint = (tools_hint(time.strftime("%A %B %-d, %Y"), search_on)
                 if tools_on else "")
         return {"role": "system",
                 "content": args.system + self_facts(model, voice_id,
@@ -2366,7 +2408,8 @@ def main() -> int:
               f"{llm_where}){RESET}")
     voice_note = (f"voice {voice_label(voice_path)}"
                   if speaking and voice_path else "voice off")
-    tools_note = " | tools: web search, grow status" if tools_on else ""
+    tools_note = ("" if not tools_on else " | tools: web search, grow status" if search_on
+                  else " | tools: grow status (web search off)")
     print(f"{DIM}model {model} | {voice_note}{tools_note} | press Enter to talk, "
           f"/help for commands{RESET}")
     if transcript:
@@ -2425,6 +2468,16 @@ def main() -> int:
                     speaking = not speaking
                     history[0] = system_msg()
                     print(f"{DIM}spoken replies {'on' if speaking else 'off'}.{RESET}")
+            elif cmd == "/search":
+                if not tools_on:
+                    print(f"{YELLOW}no tools with this server, so no web search.{RESET}")
+                else:
+                    search_on = not search_on
+                    history[0] = system_msg()
+                    print(f"{DIM}" + ("web search on: questions about current things "
+                                      "go to the search engines." if search_on else
+                                      "web search off: nothing you ask is sent to "
+                                      "search engines.") + RESET)
             elif cmd == "/voices":
                 names = available_voices()
                 print(f"{DIM}voices: {', '.join(names) if names else 'none found'}{RESET}")
@@ -2494,7 +2547,8 @@ def main() -> int:
             model, history, user_text, llm_server, tools_on,
             on_delta=speaker.feed if voiced else None, found=found,
             # Reads speaker/speaking when called, so /voice and /speak apply.
-            confirm=lambda q: confirm_action(q, speaker, speaking), grow_out=grow_text)
+            confirm=lambda q: confirm_action(q, speaker, speaking), grow_out=grow_text,
+            search_on=search_on)
         total = time.time() - t_turn
         note = nothing_changed_note(user_text, reply, used, tools_on)
         if note:

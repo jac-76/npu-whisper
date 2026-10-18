@@ -7,6 +7,7 @@ All of them drive a [FastFlowLM](https://fastflowlm.com/) server over its
 OpenAI-compatible API, started on demand. Everything runs locally. Nothing
 leaves the machine unless you use npu-chat's web search, which sends the
 question to public search engines, or point `--llm-url` at another machine.
+`NPU_CHAT_WEB_SEARCH=off` (or `--no-search`) turns the search off.
 
 Verified on a **MSI Stealth A16 AI+** (AMD Ryzen AI 9 365, XDNA2 NPU, 8 columns)
 under Omarchy/Arch Linux.
@@ -277,6 +278,13 @@ server is ollama, because that is the only server it was measured on.
   APIs, because AC Infinity answers extra polling with `403`.
 
 `--no-tools` turns both off. You hear "Let me check." while it looks things up.
+
+**Web search alone can be turned off** with `NPU_CHAT_WEB_SEARCH=off`, `--no-search`,
+or `/search` during a chat (it toggles). Then npu-chat never searches by itself,
+the model is not offered `web_search`, a search call it writes anyway is answered
+"web search is off" without sending anything, and the system prompt tells it to say
+it cannot check recent things rather than guess. Grow status still works. The banner
+shows `tools: grow status (web search off)`.
 
 **Don't leave it to the model to decide when to look.** On a set of 8 current
 facts, each answer checked by hand against at least two sources (the 2026 Super

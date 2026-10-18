@@ -1017,6 +1017,58 @@ def test_chat_turn_searches_current_questions_itself():
         srv.shutdown()
 
 
+def test_search_off_sends_nothing_to_the_search_engines():
+    """User 2026-10-17: keep the questions local. With search off a current
+    question is not searched by npu-chat, web_search is not offered, and a
+    call the model writes anyway is answered without any request."""
+    m = _load_chat()
+    queries, seen, spoken = [], [], []
+
+    def handler(path, body):
+        if path.startswith("/search"):
+            queries.append(path)
+            return "application/json", b'{"results": []}'
+        seen.append(body)
+        if len(seen) == 1:
+            return _sse({"choices": [{"delta": {"tool_calls": [
+                {"id": "c1", "index": 0, "function": {"name": "web_search",
+                                                      "arguments": '{"query":"fed chair 2026"}'}}]}}]})
+        return _sse({"choices": [{"delta": {"content": "I can't check that."}}]})
+
+    base, srv = _post_stub(handler)
+    try:
+        m.LLM_URL = base
+        m.SEARX_URL = base
+        hist = [{"role": "system", "content": "s"}]
+        question = "Who is the chair of the Federal Reserve right now?"
+        reply, _, used, _ = m.chat_turn("m", hist, question, "llama.cpp", True,
+                                        on_delta=spoken.append, log=lambda *a: None,
+                                        search_on=False)
+        assert queries == []
+        offered = [t["function"]["name"] for t in seen[0]["tools"]]
+        assert "web_search" not in offered and "grow_status" in offered
+        assert hist[1]["content"] == question                  # no results pasted in
+        assert used == [{"name": "web_search", "args": {"query": "fed chair 2026"},
+                         "result": "not sent: web search is off"}]
+        assert hist[-1]["role"] == "tool" and hist[-1]["content"] == m.SEARCH_OFF
+        assert "Let me check" not in "".join(spoken)
+        assert reply == "I can't check that."
+    finally:
+        srv.shutdown()
+
+
+def test_search_off_comes_from_the_environment_and_reaches_the_prompt(monkeypatch):
+    monkeypatch.setenv("NPU_CHAT_WEB_SEARCH", "off")
+    assert _load_chat().WEB_SEARCH is False
+    monkeypatch.delenv("NPU_CHAT_WEB_SEARCH")
+    m = _load_chat()
+    assert m.WEB_SEARCH is True                                 # unchanged by default
+    on, off = m.tools_hint("Saturday October 17, 2026"), m.tools_hint("Saturday October 17, 2026", False)
+    assert "web_search" in on and "web_search" not in off
+    assert "cannot look anything up" in off and "grow_status" in off and "October 17" in off
+    assert [t["function"]["name"] for t in m.tools_for(search=False)] == ["grow_status", "grow_control"]
+
+
 def test_grow_status_reads_cached_bar_json(tmp_path):
     """The bar JSON has raw newlines inside strings; strict=False must take it."""
     m = _load_chat()
